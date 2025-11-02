@@ -1,0 +1,11 @@
+reds_root: data/REDS
+flows_root: flows/train
+val_reds_root: data/REDS
+val_flows_root: flows/val
+scale: 4
+seq_len: 14xs
+crop_lr: 128
+batch: 16
+epochs: 50
+lr: 2e-4
+out_dir: outputs/mv_vsr

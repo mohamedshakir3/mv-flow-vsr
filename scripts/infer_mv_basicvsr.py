@@ -36,7 +36,7 @@ def run_sequence(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # model
-    model = MVBasicVSR(mid=args.mid, blocks=args.blocks, scale=args.scale).to(device)
+    model = MVSR(mid=args.mid, blocks=args.blocks, scale=args.scale).to(device)
     ckpt = torch.load(args.model, map_location='cpu')
     if isinstance(ckpt, dict) and 'state_dict' in ckpt:
         state_dict = ckpt['state_dict']

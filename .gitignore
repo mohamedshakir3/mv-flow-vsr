@@ -20,5 +20,5 @@ VSR
 *.csv
 .encodings/
 *.DS_Store
-flows_train
-flows_val
+flows_train/
+flows_val/

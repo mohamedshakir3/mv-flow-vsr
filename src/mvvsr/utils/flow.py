@@ -1,4 +1,4 @@
-# Utilities for using codec motion vectors (from LR encodes) in BasicVSR-style models.
+# Utilities for using codec motion vectors (from LR encodes).
 # - Load per-frame flows saved as npz (key: 'flow_bwd', shape HxWx2 in LR pixels)
 # - Resize flows for feature maps (divide magnitudes by scale)
 # - Warp tensors with backward flow (t -> t-1) using grid_sample
@@ -154,7 +154,7 @@ class MVProvider:
 class MVFlowNet(torch.nn.Module):
     """
     Minimal estimator shim that returns cached MVs instead of learned optical flow.
-    Intended for BasicVSR-style code where forward(I_t, I_t-1) -> flow_t.
+    Intended for recurrent super res where forward(I_t, I_t-1) -> flow_t.
     """
     def __init__(self):
         super().__init__()

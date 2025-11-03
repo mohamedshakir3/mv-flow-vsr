@@ -1,4 +1,4 @@
-import os, glob, random, argparse
+import os, glob, random, argparse, yaml
 from pathlib import Path
 import numpy as np
 import cv2
@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
+
 
 # ------------------------ Utils ------------------------
 def imread_rgb(p):
@@ -139,6 +140,20 @@ class ResidualBlock(nn.Module):
         )
     def forward(self, x): return x + self.body(x)
 
+class ResidualFlowHead(nn.Module):
+    """Predict ΔF at feature resolution"""
+    def __init__(self, c_feat=64, hidden=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(c_feat + c_feat + 2, hidden, 3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, hidden, 3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, 2, 3, padding=1)
+        )
+
+    def forward(self, feat_tm1, feat_t, flow_in):
+        # All at LR/feature resolution; flow_in in LR pixel units
+        x = torch.cat([feat_tm1, feat_t, flow_in], dim=1)
+        return self.net(x)
 class MVWarp(nn.Module):
     def __init__(self, align_corners=True):
         super().__init__()
@@ -178,6 +193,7 @@ class MVSR(nn.Module):
         for _ in range(blocks): body += [ResidualBlock(mid)]
         self.feat_ex = nn.Sequential(*body)
         self.mvwarp = MVWarp(align_corners=True)
+        self.refine = ResidualFlowHead(c_feat=mid, hidden=64)
         self.fuse   = nn.Sequential(
             nn.Conv2d(mid * 2 + 1, mid, 3, 1, 1), nn.ReLU(inplace=False),
             nn.Conv2d(mid, mid, 3, 1, 1)
@@ -193,6 +209,8 @@ class MVSR(nn.Module):
         if state is None or flow_t is None:
             new_state = cur
         else:
+            delta = self.refine(state, cur, flow_t)
+            flow_t = flow_t + delta
             prev_w, conf = self.mvwarp(state, flow_t)
             new_state = self.fuse(torch.cat([cur, prev_w, conf], dim=1))
         sr_t = self.up(new_state)
@@ -226,21 +244,34 @@ def evaluate(model, loader, device, amp_dtype=torch.float16):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--reds_root", required=True)
-    ap.add_argument("--flows_root", required=True)
-    ap.add_argument("--val_reds_root", required=True)
-    ap.add_argument("--val_flows_root", required=True)
-    ap.add_argument("--scale", type=int, default=4)
-    ap.add_argument("--seq_len", type=int, default=7)
-    ap.add_argument("--crop_lr", type=int, default=64)
-    ap.add_argument("--batch", type=int, default=2)
-    ap.add_argument("--epochs", type=int, default=50)
-    ap.add_argument("--lr", type=float, default=2e-4)
-    ap.add_argument("--num_workers", type=int, default=8)
-    ap.add_argument("--flow_tmpl", default="{t:06d}_mv.npz")
-    ap.add_argument("--img_tmpl",  default="{:08d}.png")
-    ap.add_argument("--out_dir",   default="out_mvsr")
+    ap.add_argument("--cfg", type=str, default=None, help="YAML config file")
+    # ap.add_argument("--reds_root", required=True)
+    # ap.add_argument("--flows_root", required=True)
+    # ap.add_argument("--val_reds_root", required=True)
+    # ap.add_argument("--val_flows_root", required=True)
+    # ap.add_argument("--scale", type=int, default=4)
+    # ap.add_argument("--seq_len", type=int, default=7)
+    # ap.add_argument("--crop_lr", type=int, default=64)
+    # ap.add_argument("--batch", type=int, default=2)
+    # ap.add_argument("--epochs", type=int, default=50)
+    # ap.add_argument("--lr", type=float, default=2e-4)
+    # ap.add_argument("--num_workers", type=int, default=8)
+    # ap.add_argument("--flow_tmpl", default="{t:06d}_mv.npz")
+    # ap.add_argument("--img_tmpl",  default="{:08d}.png")
+    # ap.add_argument("--out_dir",   default="out_mvsr")
     args = ap.parse_args()
+    with open(args.cfg, "r") as f:
+        cfg = yaml.safe_load(f) or {}
+
+    def apply_dict(d):
+        for k, v in d.items():
+            if isinstance(v, dict):
+                apply_dict(v)
+            else:
+                if hasattr(args, k):
+                    setattr(args, k, v)
+
+    apply_dict(cfg)
 
     assert torch.cuda.is_available(), "CUDA required"
     device = torch.device("cuda")

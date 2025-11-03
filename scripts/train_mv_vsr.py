@@ -239,7 +239,7 @@ def main():
     ap.add_argument("--num_workers", type=int, default=8)
     ap.add_argument("--flow_tmpl", default="{t:06d}_mv.npz")
     ap.add_argument("--img_tmpl",  default="{:08d}.png")
-    ap.add_argument("--out_dir",   default="work_mv_basicvsr_clean")
+    ap.add_argument("--out_dir",   default="out_mvsr")
     args = ap.parse_args()
 
     assert torch.cuda.is_available(), "CUDA required"

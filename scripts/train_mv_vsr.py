@@ -245,20 +245,10 @@ def evaluate(model, loader, device, amp_dtype=torch.float16):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cfg", type=str, default=None, help="YAML config file")
-    # ap.add_argument("--reds_root", required=True)
-    # ap.add_argument("--flows_root", required=True)
-    # ap.add_argument("--val_reds_root", required=True)
-    # ap.add_argument("--val_flows_root", required=True)
-    # ap.add_argument("--scale", type=int, default=4)
-    # ap.add_argument("--seq_len", type=int, default=7)
-    # ap.add_argument("--crop_lr", type=int, default=64)
-    # ap.add_argument("--batch", type=int, default=2)
-    # ap.add_argument("--epochs", type=int, default=50)
-    # ap.add_argument("--lr", type=float, default=2e-4)
-    # ap.add_argument("--num_workers", type=int, default=8)
-    # ap.add_argument("--flow_tmpl", default="{t:06d}_mv.npz")
-    # ap.add_argument("--img_tmpl",  default="{:08d}.png")
-    # ap.add_argument("--out_dir",   default="out_mvsr")
+    ap.add_argument("--num_workers", type=int, default=32)
+    ap.add_argument("--flow_tmpl", default="{t:06d}_mv.npz")
+    ap.add_argument("--img_tmpl",  default="{:08d}.png")
+    ap.add_argument("--out_dir",   default="out_mvsr")
     args = ap.parse_args()
     with open(args.cfg, "r") as f:
         cfg = yaml.safe_load(f) or {}
@@ -295,11 +285,13 @@ def main():
 
     train_loader = DataLoader(
         train_ds, batch_size=args.batch, shuffle=True,
-        num_workers=args.num_workers, pin_memory=True, drop_last=True
+        num_workers=args.num_workers, pin_memory=True, drop_last=True,
+        persistent_workers=True, prefetch_factor=4
     )
     val_loader = DataLoader(
         val_ds, batch_size=1, shuffle=False,
-        num_workers=max(1, min(2, args.num_workers)), pin_memory=True
+        num_workers=max(1, min(2, args.num_workers)), pin_memory=True,
+        persistent_workers=True, prefetch_factor=4
     )
 
     model = MVSR(mid=64, blocks=15, scale=args.scale).to(device)
@@ -312,7 +304,7 @@ def main():
 
     for epoch in range(1, args.epochs + 1):
         model.train()
-        pbar = tqdm(train_loader, desc=f"train epoch {epoch}")
+        pbar = tqdm(train_loader, desc=f"Train epoch {epoch}")
         for imgs, gts, flows, _, _ in pbar:
             imgs = imgs.to(device, non_blocking=True)
             gts  = gts.to(device, non_blocking=True)
@@ -326,7 +318,7 @@ def main():
             scaler.step(opt)
             scaler.update()
 
-            pbar.set_postfix(loss=f"{float(loss):.4f}")
+            pbar.set_postfix(loss=f"{float(loss.item()):.4f}")
 
         val_psnr = evaluate(model, val_loader, device, amp_dtype=amp_dtype)
         print(f"[Epoch: {epoch}] Validation PSNR: {val_psnr:.3f} dB")

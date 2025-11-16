@@ -227,15 +227,13 @@ class ResidualBlock(nn.Module):
     
 class CodecFlowHead(nn.Module):
     """
-    Predicts per-pixel from codec features:
-      - forward MV
-      - backward MV
-      - residual map
+    Predicts a residual flow correction (delta_flow)
+    from a MV prior and a residual map.
     """
     def __init__(self, hidden: int = 64):
         super().__init__()
-        # mv_fwd: 2ch, mv_bwd: 2ch, residual: 1ch  => 5 total
-        in_ch = 5
+        # mv: 2ch, residual: 1ch  => 3 total
+        in_ch = 3
         self.net = nn.Sequential(
             nn.Conv2d(in_ch, hidden, 3, padding=1),
             nn.ReLU(inplace=True),
@@ -244,11 +242,11 @@ class CodecFlowHead(nn.Module):
             nn.Conv2d(hidden, 2, 3, padding=1),  # output flow dx,dy
         )
 
-    def forward(self, mv_fwd, mv_bwd, residual):
-        # mv_*: (B, 2, H, W), residual: (B, 1, H, W) or (B, H, W)
+    def forward(self, mv, residual):
+        # mv: (B, 2, H, W), residual: (B, 1, H, W) or (B, H, W)
         if residual.dim() == 3:
             residual = residual.unsqueeze(1)
-        x = torch.cat([mv_fwd, mv_bwd, residual], dim=1)
+        x = torch.cat([mv, residual], dim=1)
         return self.net(x)
 
 class MVWarp(nn.Module):
@@ -287,20 +285,25 @@ class MVSR(nn.Module):
         super().__init__()
         self.scale = scale
 
-        # LR feature extractor
         body = [nn.Conv2d(3, mid, 3, 1, 1), nn.ReLU(inplace=False)]
         for _ in range(blocks):
             body += [ResidualBlock(mid)]
         self.feat_ex = nn.Sequential(*body)
 
-        # motion + fusion + upsampling
         self.mvwarp = MVWarp(align_corners=True)
-        self.codec_flow = CodecFlowHead(hidden=64)
-        self.fuse = nn.Sequential(
+        self.codec_flow_fwd = CodecFlowHead(hidden=64)
+        self.codec_flow_bwd = CodecFlowHead(hidden=64)
+        self.prop_fwd = nn.Sequential(
             nn.Conv2d(mid * 2 + 1, mid, 3, 1, 1),  # feat_t + warped_state + conf
             nn.ReLU(inplace=False),
             nn.Conv2d(mid, mid, 3, 1, 1),
         )
+        self.prop_bwd = nn.Sequential(
+            nn.Conv2d(mid * 2 + 1, mid, 3, 1, 1),  # feat_t + warped_state + conf
+            nn.ReLU(inplace=False),
+            nn.Conv2d(mid, mid, 3, 1, 1),
+        )
+        self.fusion = nn.Conv2d(mid * 2, mid, 3, 1, 1)
         self.up = nn.Sequential(
             nn.Conv2d(mid, mid * 4, 3, 1, 1),
             nn.PixelShuffle(2),
@@ -321,7 +324,6 @@ class MVSR(nn.Module):
         # current frame features
         feat_t = self.feat_ex(lr_t)  # (B, mid, H, W)
 
-        # first frame: no motion info, init state from frame itself
         if state is None:
             state = feat_t
             sr_t = self.up(state)
@@ -330,18 +332,14 @@ class MVSR(nn.Module):
         if res_t.dim() == 3:
             res_t = res_t.unsqueeze(1)  # (B,1,H,W)
 
-        # 1) codec-based flow from MV_fwd, MV_bwd, residual
         F_codec = self.codec_flow(mv_fwd_t, mv_bwd_t, res_t)  # (B,2,H,W)
 
-        # 2) warp previous state
         # warped: (B,mid,H,W), conf: (B,1,H,W)
         warped, conf = self.mvwarp(state, F_codec)
 
-        # 3) fuse warped state + current features + confidence
         x = torch.cat([feat_t, warped, conf], dim=1)          # (B,2*mid+1,H,W)
         state = self.fuse(x)
 
-        # 4) reconstruct SR
         sr_t = self.up(state)
         return sr_t, state
 
@@ -353,21 +351,79 @@ class MVSR(nn.Module):
         residual: (B,T,1,H,W)
         """
         B, T, _, H, W = imgs.shape
-        outs = []
-        state = None
+        
+        # Extract all features first
+        # (B,T,C,H,W) -> (B*T,C,H,W) -> (B*T,mid,H,W) -> (B,T,mid,H,W)
+        feats = self.feat_ex(imgs.view(B * T, 3, H, W))
+        feats = feats.view(B, T, -1, H, W)
 
+        h_fwd = None
+        fwd_feats = []
+        delta_flows_fwd = []
+
+        # --- 1. Forward Propagation ---
         for t in range(T):
-            lr_t  = imgs[:, t]       # (B,3,H,W)
-            mvf_t = mv_fwd[:, t]     # (B,2,H,W)
-            mvb_t = mv_bwd[:, t]     # (B,2,H,W)
-            res_t = residual[:, t]   # (B,1,H,W)
+            feat_t = feats[:, t]
+            if h_fwd is None:
+                h_fwd = feat_t # Init hidden state
+            
+            # Predict residual flow and refine
+            mvf_t = mv_fwd[:, t]
+            res_t = residual[:, t]
+            delta_fwd = self.flow_head_fwd(mvf_t, res_t)
+            flow_fwd = mvf_t + delta_fwd
 
-            sr_t, state = self.step(lr_t, mvf_t, mvb_t, res_t, state)
+            # Warp previous state
+            warped_fwd, conf_fwd = self.mvwarp(h_fwd, flow_fwd)
+
+            # Fuse and update hidden state
+            x_fwd = torch.cat([feat_t, warped_fwd, conf_fwd], dim=1)
+            h_fwd = self.prop_fwd(x_fwd)
+            
+            fwd_feats.append(h_fwd)
+            delta_flows_fwd.append(delta_fwd)
+
+        h_bwd = None
+        bwd_feats = []
+        delta_flows_bwd = []
+
+        # --- 2. Backward Propagation ---
+        for t in range(T - 1, -1, -1):
+            feat_t = feats[:, t]
+            if h_bwd is None:
+                h_bwd = feat_t # Init hidden state
+
+            # Predict residual flow and refine
+            mvb_t = mv_bwd[:, t]
+            res_t = residual[:, t]
+            delta_bwd = self.flow_head_bwd(mvb_t, res_t)
+            flow_bwd = mvb_t + delta_bwd
+
+            # Warp previous state
+            warped_bwd, conf_bwd = self.mvwarp(h_bwd, flow_bwd)
+            # Fuse and update hidden state
+            x_bwd = torch.cat([feat_t, warped_bwd, conf_bwd], dim=1)
+            h_bwd = self.prop_bwd(x_bwd)
+
+            bwd_feats.append(h_bwd)
+            delta_flows_bwd.append(delta_bwd)
+
+        bwd_feats = bwd_feats[::-1]
+
+        outs = []
+        for t in range(T):
+            fused_t = self.fusion(torch.cat([fwd_feats[t], bwd_feats[t]], dim=1))
+            sr_t = self.up(fused_t)
             outs.append(sr_t)
 
-        return torch.stack(outs, dim=1)  # (B,T,3,4H,4W)
+        return (
+            torch.stack(outs, dim=1),            # (B,T,3,4H,4W)
+            torch.stack(delta_flows_fwd, dim=1), # (B,T,2,H,W)
+            torch.stack(delta_flows_bwd, dim=1)  # (B,T,2,H,W)
+        )
 
 # ------------------------ Train / Val ------------------------
+
 @torch.no_grad()
 def evaluate(model, loader, device, amp_dtype=torch.float16):
     model.eval()
@@ -380,7 +436,7 @@ def evaluate(model, loader, device, amp_dtype=torch.float16):
         residual = residual.to(device, non_blocking=True)   # (B,T,1,H,W)
 
         with torch.autocast(device_type="cuda", dtype=amp_dtype):
-            sr = model(imgs, mv_fwd, mv_bwd, residual)
+            sr, _, _ = model(imgs, mv_fwd, mv_bwd, residual)
 
         psnr_sum += float(psnr_torch_perframe(sr, gts)) * imgs.size(0)
         ncount   += imgs.size(0)
@@ -395,6 +451,19 @@ def main():
     ap.add_argument("--flow_tmpl", default="{t:06d}_mv.npz")
     ap.add_argument("--img_tmpl",  default="{:08d}.png")
     ap.add_argument("--out_dir",   default="out_mvsr")
+    
+    ap.add_argument("--reds_root", type=str, default=None)
+    ap.add_argument("--val_reds_root", type=str, default=None)
+    ap.add_argument("--flows_root", type=str, default=None)
+    ap.add_argument("--val_flows_root", type=str, default=None)
+    ap.add_argument("--scale", type=int, default=4)
+    ap.add_argument("--seq_len", type=int, default=14)
+    ap.add_argument("--crop_lr", type=int, default=96)
+    ap.add_argument("--batch", type=int, default=24)
+    ap.add_argument("--epochs", type=int, default=50)
+    ap.add_argument("--lr", type=float, default=2e-4)
+    ap.add_argument("--lambda_l1", type=float, default=0.05,
+                        help="Weight for the L1 sparsity loss on residual flow")
     args = ap.parse_args()
     with open(args.cfg, "r") as f:
         cfg = yaml.safe_load(f) or {}
@@ -458,7 +527,6 @@ def main():
     writer = SummaryWriter(log_dir=args.out_dir)
     tb_step = 0
 
-
     for epoch in range(1, args.epochs + 1):
         model.train()
         pbar = tqdm(train_loader, desc=f"Train epoch {epoch}")
@@ -471,15 +539,31 @@ def main():
 
             opt.zero_grad(set_to_none=True)
             with torch.autocast(device_type="cuda", dtype=amp_dtype):
-                sr   = model(imgs, mv_fwd, mv_bwd, residual)  # (B,T,3,4H,4W)
-                loss = charbonnier_loss(sr, gts)
+                sr, delta_fwd, delta_bwd = model(imgs, mv_fwd, mv_bwd, residual)
+                
+                recon_loss = charbonnier_loss(sr, gts)
+
+                # L1 loss
+                l1_loss_fwd = torch.mean(torch.abs(delta_fwd))
+                l1_loss_bwd = torch.mean(torch.abs(delta_bwd))
+                sparsity_loss = l1_loss_fwd + l1_loss_bwd
+
+                # 4. Combine losses
+                loss = recon_loss + (args.lambda_l1 * sparsity_loss)
+
             scaler.scale(loss).backward()
             scaler.step(opt)
             scaler.update()
 
-            pbar.set_postfix(loss=f"{float(loss.item()):.4f}")
+            pbar.set_postfix(
+                loss=f"{float(loss.item()):.4f}",
+                recon=f"{float(recon_loss.item()):.4f}",
+                sparse=f"{float(sparsity_loss.item()):.4f}"
+            )
             
-            writer.add_scalar("train/loss", loss.item(), tb_step)
+            writer.add_scalar("train/loss_total", loss.item(), tb_step)
+            writer.add_scalar("train/loss_recon", recon_loss.item(), tb_step)
+            writer.add_scalar("train/loss_sparse", sparsity_loss.item(), tb_step)
             tb_step += 1
 
         val_psnr = evaluate(model, val_loader, device, amp_dtype=amp_dtype)

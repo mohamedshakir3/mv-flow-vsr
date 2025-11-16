@@ -212,7 +212,7 @@ def process_reds_train_sharp(
     crf: int = 23,
     fps: int = 25,
 ):
-    train_sharp_dir = reds_root / "train_sharp"
+    train_sharp_dir = reds_root / "val_sharp"
     seq_dirs = sorted([p for p in train_sharp_dir.iterdir() if p.is_dir()])
 
     for seq_dir in seq_dirs:

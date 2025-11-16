@@ -291,8 +291,8 @@ class MVSR(nn.Module):
         self.feat_ex = nn.Sequential(*body)
 
         self.mvwarp = MVWarp(align_corners=True)
-        self.codec_flow_fwd = CodecFlowHead(hidden=64)
-        self.codec_flow_bwd = CodecFlowHead(hidden=64)
+        self.flow_head_fwd = CodecFlowHead(hidden=64)
+        self.flow_head_bwd = CodecFlowHead(hidden=64)
         self.prop_fwd = nn.Sequential(
             nn.Conv2d(mid * 2 + 1, mid, 3, 1, 1),  # feat_t + warped_state + conf
             nn.ReLU(inplace=False),

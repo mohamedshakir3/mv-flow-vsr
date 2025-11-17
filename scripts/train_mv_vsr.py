@@ -303,6 +303,20 @@ class MVSR(nn.Module):
             nn.ReLU(inplace=False),
             nn.Conv2d(mid, mid, 3, 1, 1),
         )
+        
+        self.temporal_gate_fwd = nn.Sequential(
+            nn.Conv2d(1, 16, 3, 1, 1), # Input is 1-ch residual
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 1, 3, 1, 1),
+            nn.Sigmoid()
+        )
+        self.temporal_gate_bwd = nn.Sequential(
+            nn.Conv2d(1, 16, 3, 1, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 1, 3, 1, 1),
+            nn.Sigmoid()
+        )
+        
         self.fusion = nn.Conv2d(mid * 2, mid, 3, 1, 1)
         self.up = nn.Sequential(
             nn.Conv2d(mid, mid * 4, 3, 1, 1),
@@ -361,24 +375,27 @@ class MVSR(nn.Module):
         fwd_feats = []
         delta_flows_fwd = []
 
-        # --- 1. Forward Propagation ---
         for t in range(T):
             feat_t = feats[:, t]
             if h_fwd is None:
-                h_fwd = feat_t # Init hidden state
+                h_fwd = feat_t
             
-            # Predict residual flow and refine
             mvf_t = mv_fwd[:, t]
             res_t = residual[:, t]
+            mask = (res_t > 0).float()
+
             delta_fwd = self.flow_head_fwd(mvf_t, res_t)
             flow_fwd = mvf_t + delta_fwd
 
             # Warp previous state
             warped_fwd, conf_fwd = self.mvwarp(h_fwd, flow_fwd)
+            
+            G_t_fwd = self.temporal_gate_fwd(res_t)
+            x_fwd = torch.cat([feat_t, G_t_fwd * warped_fwd, conf_fwd], dim=1)
+            
+            h_fwd_update = self.prop_fwd(x_fwd)
 
-            # Fuse and update hidden state
-            x_fwd = torch.cat([feat_t, warped_fwd, conf_fwd], dim=1)
-            h_fwd = self.prop_fwd(x_fwd)
+            h_fwd = (mask * h_fwd_update) + ((1 - mask) * warped_fwd)
             
             fwd_feats.append(h_fwd)
             delta_flows_fwd.append(delta_fwd)
@@ -387,23 +404,23 @@ class MVSR(nn.Module):
         bwd_feats = []
         delta_flows_bwd = []
 
-        # --- 2. Backward Propagation ---
         for t in range(T - 1, -1, -1):
             feat_t = feats[:, t]
             if h_bwd is None:
-                h_bwd = feat_t # Init hidden state
+                h_bwd = feat_t
 
-            # Predict residual flow and refine
             mvb_t = mv_bwd[:, t]
             res_t = residual[:, t]
+            mask = (res_t > 0).float()
             delta_bwd = self.flow_head_bwd(mvb_t, res_t)
             flow_bwd = mvb_t + delta_bwd
 
-            # Warp previous state
             warped_bwd, conf_bwd = self.mvwarp(h_bwd, flow_bwd)
-            # Fuse and update hidden state
-            x_bwd = torch.cat([feat_t, warped_bwd, conf_bwd], dim=1)
-            h_bwd = self.prop_bwd(x_bwd)
+
+            G_t_bwd = self.temporal_gate_bwd(res_t)
+            x_bwd = torch.cat([feat_t, G_t_bwd * warped_bwd, conf_bwd], dim=1)
+            h_bwd_update = self.prop_bwd(x_bwd)
+            h_bwd = (mask * h_bwd_update) + ((1 - mask) * warped_bwd)
 
             bwd_feats.append(h_bwd)
             delta_flows_bwd.append(delta_bwd)
@@ -517,6 +534,19 @@ def main():
     )
 
     model = MVSR(mid=64, blocks=15, scale=args.scale).to(device)
+    checkpoint_path = os.path.join(args.out_dir, "best.pth")
+    
+    if os.path.exists(checkpoint_path):
+        print(f"--- Loading weights from {checkpoint_path} ---")
+        
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        
+        model.load_state_dict(checkpoint, strict=False)
+        
+        print("--- Weights loaded successfully ---")
+    else:
+        print(f"--- No checkpoint found at {checkpoint_path}, starting from scratch ---")
+
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.99))
     scaler = torch.amp.GradScaler()
 

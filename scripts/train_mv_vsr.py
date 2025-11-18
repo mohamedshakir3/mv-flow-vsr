@@ -435,7 +435,7 @@ class MVSR(nn.Module):
 
             fuse_in = torch.cat([fwd_feats[t], bwd_feats[t], feat_t, res_t], dim=1)
             fused_t = self.fusion(fuse_in)
-            
+
             sr_t = self.up(fused_t)
             outs.append(sr_t)
 
@@ -558,7 +558,7 @@ def main():
 
     os.makedirs(args.out_dir, exist_ok=True)
     best_psnr = -1.0
-    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16f
+    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     
     writer = SummaryWriter(log_dir=args.out_dir)
     tb_step = 0

@@ -248,6 +248,29 @@ class CodecFlowHead(nn.Module):
             residual = residual.unsqueeze(1)
         x = torch.cat([mv, residual], dim=1)
         return self.net(x)
+class SFTResidualBlock(nn.Module):
+    """
+    Spatial Feature Transform (SFT) Residual Block.
+    Uses the 'cond' feature map to modulate the main features.
+    """
+    def __init__(self, nf):
+        super().__init__()
+        self.sft_scale = nn.Conv2d(nf, nf, 1)
+        self.sft_shift = nn.Conv2d(nf, nf, 1)
+        
+        self.body = nn.Sequential(
+            nn.Conv2d(nf, nf, 3, 1, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(nf, nf, 3, 1, 1)
+        )
+
+    def forward(self, x, cond):
+        scale = self.sft_scale(cond)
+        shift = self.sft_shift(cond)
+        
+        modulated_x = x * (1 + scale) + shift
+        
+        return x + self.body(modulated_x)
 
 class MVWarp(nn.Module):
     def __init__(self, align_corners=True):
@@ -280,83 +303,113 @@ class MVWarp(nn.Module):
         conf = valid * torch.exp(-(mag / 8.0) ** 2)
         return warped, conf
 
+class CodecConditioner(nn.Module):
+    """
+    Compresses Codec Priors (Residual + MV Magnitude) into a 
+    conditioning feature map for SFT.
+    """
+    def __init__(self, out_ch=64):
+        super().__init__()
+        # Input: Residual (1ch) + MV Magnitude (1ch) = 2ch
+        self.net = nn.Sequential(
+            nn.Conv2d(2, 32, 3, 1, 1),
+            nn.LeakyReLU(0.1, True),
+            nn.Conv2d(32, 32, 3, 1, 1),
+            nn.LeakyReLU(0.1, True),
+            nn.Conv2d(32, out_ch, 3, 1, 1) 
+        )
+
+    def forward(self, res, mv):
+        # mv: (B, 2, H, W) -> Magnitude: (B, 1, H, W)
+        mv_mag = torch.norm(mv, dim=1, keepdim=True)
+        
+        if res.dim() == 3:
+            res = res.unsqueeze(1)
+            
+        cond_input = torch.cat([res, mv_mag], dim=1)
+        return self.net(cond_input)
+class ResidualFlowHead(nn.Module):
+    """
+    Predicts flow purely from features (Since MVs were shown to be useless here).
+    """
+    def __init__(self, c_feat=64, hidden=64):
+        super().__init__()
+        # Input: Feat_t-1 (64) + Feat_t (64) = 128 channels
+        self.net = nn.Sequential(
+            nn.Conv2d(c_feat * 2, hidden, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, hidden, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, 2, 3, padding=1) 
+        )
+        
+        # Initialize output to small random values or zero
+        # (Zero is safe, lets it learn from scratch)
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, feat_tm1, feat_t):
+        # feat: (B, C, H, W)
+        x = torch.cat([feat_tm1, feat_t], dim=1)
+        flow = self.net(x)
+        return flow
+
 class MVSR(nn.Module):
     def __init__(self, mid=64, blocks=15, scale=4):
         super().__init__()
         self.scale = scale
 
-        body = [nn.Conv2d(3, mid, 3, 1, 1), nn.ReLU(inplace=False)]
-        for _ in range(blocks):
-            body += [ResidualBlock(mid)]
-        self.feat_ex = nn.Sequential(*body)
+        self.conditioner = CodecConditioner(out_ch=mid)
+
+        self.conv_first = nn.Conv2d(3, mid, 3, 1, 1)
+        self.relu = nn.ReLU(inplace=True)
+        
+        self.sft_blocks = nn.ModuleList([SFTResidualBlock(mid) for _ in range(blocks)])
 
         self.mvwarp = MVWarp(align_corners=True)
-        self.flow_head_fwd = CodecFlowHead(hidden=64)
-        self.flow_head_bwd = CodecFlowHead(hidden=64)
+        
+        self.flow_head_fwd = ResidualFlowHead(c_feat=mid, hidden=64)
+        self.flow_head_bwd = ResidualFlowHead(c_feat=mid, hidden=64)
+        
         self.prop_fwd = nn.Sequential(
-            nn.Conv2d(mid * 2 + 1, mid, 3, 1, 1),  # feat_t + warped_state + conf
-            nn.ReLU(inplace=False),
-            nn.Conv2d(mid, mid, 3, 1, 1),
+            nn.Conv2d(mid * 2 + 1, mid, 3, 1, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid, mid, 3, 1, 1)
         )
         self.prop_bwd = nn.Sequential(
-            nn.Conv2d(mid * 2 + 1, mid, 3, 1, 1),  # feat_t + warped_state + conf
-            nn.ReLU(inplace=False),
-            nn.Conv2d(mid, mid, 3, 1, 1),
+            nn.Conv2d(mid * 2 + 1, mid, 3, 1, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid, mid, 3, 1, 1)
         )
         
-        self.temporal_gate_fwd = nn.Sequential(
-            nn.Conv2d(1, 16, 3, 1, 1), # Input is 1-ch residual
-            nn.ReLU(inplace=True),
-            nn.Conv2d(16, 1, 3, 1, 1),
-            nn.Sigmoid()
-        )
-        self.temporal_gate_bwd = nn.Sequential(
-            nn.Conv2d(1, 16, 3, 1, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(16, 1, 3, 1, 1),
-            nn.Sigmoid()
-        )
+        self.fusion = nn.Conv2d(mid * 3 + 1, mid, 3, 1, 1)
         
-        fusion_channels = mid * 3 + 1 # h_fwd_t, h_bwd_t, F_t, Res_t
-        self.fusion = nn.Conv2d(fusion_channels, mid, 3, 1, 1)
         self.up = nn.Sequential(
             nn.Conv2d(mid, mid * 4, 3, 1, 1),
             nn.PixelShuffle(2),
-            nn.ReLU(inplace=False),
+            nn.ReLU(inplace=True),
             nn.Conv2d(mid, mid * 4, 3, 1, 1),
             nn.PixelShuffle(2),
-            nn.ReLU(inplace=False),
+            nn.ReLU(inplace=True),
             nn.Conv2d(mid, 3, 3, 1, 1),
         )
 
-    def step(self, lr_t, mv_fwd_t, mv_bwd_t, res_t, state):
-        """
-        lr_t:    (B, 3, H, W)
-        mv_*_t:  (B, 2, H, W)
-        res_t:   (B, 1, H, W) or (B, H, W)
-        state:   (B, mid, H, W) or None
-        """
-        # current frame features
-        feat_t = self.feat_ex(lr_t)  # (B, mid, H, W)
-
-        if state is None:
-            state = feat_t
-            sr_t = self.up(state)
-            return sr_t, state
-
-        if res_t.dim() == 3:
-            res_t = res_t.unsqueeze(1)  # (B,1,H,W)
-
-        F_codec = self.codec_flow(mv_fwd_t, mv_bwd_t, res_t)  # (B,2,H,W)
-
-        # warped: (B,mid,H,W), conf: (B,1,H,W)
-        warped, conf = self.mvwarp(state, F_codec)
-
-        x = torch.cat([feat_t, warped, conf], dim=1)          # (B,2*mid+1,H,W)
-        state = self.fuse(x)
-
-        sr_t = self.up(state)
-        return sr_t, state
+    def extract_features(self, lr_imgs, conds):
+        # lr_imgs: (B, T, 3, H, W)
+        # conds:   (B, T, mid, H, W)
+        B, T, _, H, W = lr_imgs.shape
+        
+        # Flatten T into B
+        x = lr_imgs.view(B*T, 3, H, W)
+        c = conds.view(B*T, self.mid, H, W)
+        
+        feat = self.relu(self.conv_first(x))
+        
+        # Pass through SFT blocks
+        for block in self.sft_blocks:
+            feat = block(feat, c)
+            
+        return feat.view(B, T, self.mid, H, W)
 
     def forward(self, imgs, mv_fwd, mv_bwd, residual):
         """
@@ -367,83 +420,63 @@ class MVSR(nn.Module):
         """
         B, T, _, H, W = imgs.shape
         
-        # Extract all features first
-        # (B,T,C,H,W) -> (B*T,C,H,W) -> (B*T,mid,H,W) -> (B,T,mid,H,W)
-        feats = self.feat_ex(imgs.view(B * T, 3, H, W))
-        feats = feats.view(B, T, -1, H, W)
+        mv_mag_combined = (mv_fwd + mv_bwd) / 2.0
+        
+        res_flat = residual.view(B*T, 1, H, W)
+        mv_flat  = mv_mag_combined.view(B*T, 2, H, W)
+        
+        conds = self.conditioner(res_flat, mv_flat).view(B, T, self.mid, H, W)
+        
+        feats = self.extract_features(imgs, conds)
 
         h_fwd = None
         fwd_feats = []
-        delta_flows_fwd = []
 
         for t in range(T):
             feat_t = feats[:, t]
+            
             if h_fwd is None:
                 h_fwd = feat_t
-            
-            mvf_t = mv_fwd[:, t]
-            res_t = residual[:, t]
-            mask = (res_t > 0).float()
-
-            delta_fwd = self.flow_head_fwd(mvf_t, res_t)
-            flow_fwd = mvf_t + delta_fwd
-
-            # Warp previous state
-            warped_fwd, conf_fwd = self.mvwarp(h_fwd, flow_fwd)
-            
-            G_t_fwd = self.temporal_gate_fwd(res_t)
-            x_fwd = torch.cat([feat_t, G_t_fwd * warped_fwd, conf_fwd], dim=1)
-            
-            h_fwd_update = self.prop_fwd(x_fwd)
-
-            h_fwd = (mask * h_fwd_update) + ((1 - mask) * warped_fwd)
+            else:
+                flow_fwd = self.flow_head_fwd(h_fwd, feat_t)
+                warped_h, mask = self.mvwarp(h_fwd, flow_fwd)
+                
+                x_fwd = torch.cat([feat_t, warped_h, mask], dim=1)
+                h_fwd = self.prop_fwd(x_fwd)
             
             fwd_feats.append(h_fwd)
-            delta_flows_fwd.append(delta_fwd)
 
         h_bwd = None
         bwd_feats = []
-        delta_flows_bwd = []
 
         for t in range(T - 1, -1, -1):
             feat_t = feats[:, t]
+            
             if h_bwd is None:
                 h_bwd = feat_t
-
-            mvb_t = mv_bwd[:, t]
-            res_t = residual[:, t]
-            mask = (res_t > 0).float()
-            delta_bwd = self.flow_head_bwd(mvb_t, res_t)
-            flow_bwd = mvb_t + delta_bwd
-
-            warped_bwd, conf_bwd = self.mvwarp(h_bwd, flow_bwd)
-
-            G_t_bwd = self.temporal_gate_bwd(res_t)
-            x_bwd = torch.cat([feat_t, G_t_bwd * warped_bwd, conf_bwd], dim=1)
-            h_bwd_update = self.prop_bwd(x_bwd)
-            h_bwd = (mask * h_bwd_update) + ((1 - mask) * warped_bwd)
-
+            else:
+                flow_bwd = self.flow_head_bwd(h_fwd, feat_t)
+                warped_h, mask = self.mvwarp(h_bwd, flow_bwd)
+                
+                x_bwd = torch.cat([feat_t, warped_h, mask], dim=1)
+                h_bwd = self.prop_bwd(x_bwd)
+                
             bwd_feats.append(h_bwd)
-            delta_flows_bwd.append(delta_bwd)
 
         bwd_feats = bwd_feats[::-1]
 
         outs = []
         for t in range(T):
-            feat_t = feats[:, t]       # (B, mid, H, W)
-            res_t  = residual[:, t]    # (B, 1, H, W)
+            feat_t = feats[:, t]
+            res_t  = residual[:, t]
+            if res_t.dim() == 3: res_t = res_t.unsqueeze(1)
 
             fuse_in = torch.cat([fwd_feats[t], bwd_feats[t], feat_t, res_t], dim=1)
-            fused_t = self.fusion(fuse_in)
-
-            sr_t = self.up(fused_t)
+            fused = self.fusion(fuse_in)
+            sr_t = self.up(fused)
             outs.append(sr_t)
 
-        return (
-            torch.stack(outs, dim=1),            # (B,T,3,4H,4W)
-            torch.stack(delta_flows_fwd, dim=1), # (B,T,2,H,W)
-            torch.stack(delta_flows_bwd, dim=1)  # (B,T,2,H,W)
-        )
+        return torch.stack(outs, dim=1) # (B,T,3,4H,4W)
 
 # ------------------------ Train / Val ------------------------
 
@@ -459,7 +492,7 @@ def evaluate(model, loader, device, amp_dtype=torch.float16):
         residual = residual.to(device, non_blocking=True)   # (B,T,1,H,W)
 
         with torch.autocast(device_type="cuda", dtype=amp_dtype):
-            sr, _, _ = model(imgs, mv_fwd, mv_bwd, residual)
+            sr = model(imgs, mv_fwd, mv_bwd, residual)
 
         psnr_sum += float(psnr_torch_perframe(sr, gts)) * imgs.size(0)
         ncount   += imgs.size(0)
@@ -540,18 +573,6 @@ def main():
     )
 
     model = MVSR(mid=64, blocks=15, scale=args.scale).to(device)
-    checkpoint_path = os.path.join(args.out_dir, "best.pth")
-    
-    if os.path.exists(checkpoint_path):
-        print(f"--- Loading weights from {checkpoint_path} ---")
-        
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        
-        model.load_state_dict(checkpoint, strict=False)
-        
-        print("--- Weights loaded successfully ---")
-    else:
-        print(f"--- No checkpoint found at {checkpoint_path}, starting from scratch ---")
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.99))
     scaler = torch.amp.GradScaler()
@@ -575,17 +596,9 @@ def main():
 
             opt.zero_grad(set_to_none=True)
             with torch.autocast(device_type="cuda", dtype=amp_dtype):
-                sr, delta_fwd, delta_bwd = model(imgs, mv_fwd, mv_bwd, residual)
-                
-                recon_loss = charbonnier_loss(sr, gts)
+                sr = model(imgs, mv_fwd, mv_bwd, residual)
+                loss = charbonnier_loss(sr, gts)
 
-                # L1 loss
-                l1_loss_fwd = torch.mean(torch.abs(delta_fwd))
-                l1_loss_bwd = torch.mean(torch.abs(delta_bwd))
-                sparsity_loss = l1_loss_fwd + l1_loss_bwd
-
-                # 4. Combine losses
-                loss = recon_loss + (args.lambda_l1 * sparsity_loss)
 
             scaler.scale(loss).backward()
             scaler.step(opt)
@@ -593,13 +606,9 @@ def main():
 
             pbar.set_postfix(
                 loss=f"{float(loss.item()):.4f}",
-                recon=f"{float(recon_loss.item()):.4f}",
-                sparse=f"{float(sparsity_loss.item()):.4f}"
             )
             
             writer.add_scalar("train/loss_total", loss.item(), tb_step)
-            writer.add_scalar("train/loss_recon", recon_loss.item(), tb_step)
-            writer.add_scalar("train/loss_sparse", sparsity_loss.item(), tb_step)
             tb_step += 1
 
         val_psnr = evaluate(model, val_loader, device, amp_dtype=amp_dtype)

@@ -357,6 +357,8 @@ class ResidualFlowHead(nn.Module):
 class MVSR(nn.Module):
     def __init__(self, mid=64, blocks=15, scale=4):
         super().__init__()
+        self.mid = mid
+        self.blocks = blocks
         self.scale = scale
 
         self.conditioner = CodecConditioner(out_ch=mid)

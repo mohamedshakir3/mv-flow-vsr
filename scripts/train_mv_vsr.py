@@ -258,6 +258,11 @@ class SFTResidualBlock(nn.Module):
         self.sft_scale = nn.Conv2d(nf, nf, 1)
         self.sft_shift = nn.Conv2d(nf, nf, 1)
         
+        nn.init.zeros_(self.sft_scale.weight)
+        nn.init.zeros_(self.sft_scale.bias)
+        nn.init.zeros_(self.sft_shift.weight)
+        nn.init.zeros_(self.sft_shift.bias)
+        
         self.body = nn.Sequential(
             nn.Conv2d(nf, nf, 3, 1, 1),
             nn.ReLU(inplace=True),

@@ -630,12 +630,12 @@ def main():
     train_loader = DataLoader(
         train_ds, batch_size=args.batch, shuffle=True,
         num_workers=args.num_workers, pin_memory=True, drop_last=True,
-        persistent_workers=True, prefetch_factor=4
+        persistent_workers=True, prefetch_factor=2
     )
     val_loader = DataLoader(
         val_ds, batch_size=1, shuffle=False,
         num_workers=max(1, min(2, args.num_workers)), pin_memory=True,
-        persistent_workers=True, prefetch_factor=4
+        persistent_workers=True, prefetch_factor=2
     )
 
     model = MVSR(mid=64, blocks=15, scale=args.scale).to(device)

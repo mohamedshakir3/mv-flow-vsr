@@ -4,8 +4,8 @@ val_reds_root: /workspace/data/REDS/val
 val_flows_root: /workspace/flows/val
 scale: 4
 seq_len: 14
-crop_lr: 96
-batch: 24
+crop_lr: 64
+batch: 16
 epochs: 50
 lr: 0.0002
 out_dir: outputs/mv_vsr

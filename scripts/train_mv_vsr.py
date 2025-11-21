@@ -520,7 +520,7 @@ class MVSR(nn.Module):
         
         for t in range(T - 1, -1, -1):
             flow = self.compute_flow(mv_bwd[:, t]) 
-            h_bwd = self.warper(h_bwd, flow)
+            h_bwd = self.mvwarp(h_bwd, flow)
             
             h_bwd = h_bwd + feats[:, t]
             h_bwd = self.backward_resblocks(h_bwd)
@@ -532,7 +532,7 @@ class MVSR(nn.Module):
         
         for t in range(T):
             flow = self.compute_flow(mv_fwd[:, t])
-            h_fwd = self.warper(h_fwd, flow)
+            h_fwd = self.mvwarp(h_fwd, flow)
             
             h_fwd = h_fwd + feats[:, t]
             h_fwd = self.forward_resblocks(h_fwd)

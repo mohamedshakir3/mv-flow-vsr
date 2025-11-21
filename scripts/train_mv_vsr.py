@@ -85,9 +85,11 @@ class RedsMVSRDataset(Dataset):
         mvb_dir  = os.path.join(self.codec_root, clip, "mv_bwd")
         res_dir  = os.path.join(self.codec_root, clip, "residual")
         gt_dir   = os.path.join(self.gt_root, clip)
+        part_dir = os.path.join(self.codec_root, clip, "partition_maps")
+        
 
         imgs_lr, imgs_gt = [], []
-        mv_fwd_list, mv_bwd_list, res_list = [], [], []
+        mv_fwd_list, mv_bwd_list, res_list, part_list = [], [], [], []
 
         for t in range(start, start + self.seq_len):
             fn = self.img_tmpl.format(t)
@@ -129,6 +131,13 @@ class RedsMVSRDataset(Dataset):
             else:
                 mvb = np.zeros((2, H, W), np.float32)
             mv_bwd_list.append(mvb)
+            
+            p_part = os.path.join(part_dir, f"{stem}_part.npy")
+            if os.path.exists(p_part):
+                pmap = np.load(p_part).astype(np.int64) 
+            else:
+                pmap = np.full((H//16, W//16), 2, dtype=np.int64)
+            part_list.append(pmap)
 
             if t == 0:
                 res = np.zeros((H, W), np.float32)
@@ -140,11 +149,12 @@ class RedsMVSRDataset(Dataset):
                     res = np.zeros((H, W), np.float32)
             res_list.append(res)
 
+        part_arr = np.stack(part_list, axis=0) # (T, H/16, W/16)
         mv_fwd_arr = np.stack(mv_fwd_list, axis=0)  # (T,2,H,W)
         mv_bwd_arr = np.stack(mv_bwd_list, axis=0)  # (T,2,H,W)
         res_arr    = np.stack(res_list,    axis=0)  # (T,H,W)
 
-        return lr_arr, gt_arr, mv_fwd_arr, mv_bwd_arr, res_arr
+        return lr_arr, gt_arr, mv_fwd_arr, mv_bwd_arr, res_arr, part_arr
 
     def _random_crop(self, lr, gt, mv_fwd, mv_bwd, res):
         T, H, W, _ = lr.shape
@@ -196,7 +206,7 @@ class RedsMVSRDataset(Dataset):
 
     def __getitem__(self, idx):
         clip, s = self.samples[idx]
-        lr, gt, mv_fwd, mv_bwd, res = self._load_seq(clip, s)
+        lr, gt, mv_fwd, mv_bwd, res, part = self._load_seq(clip, s)
 
         if self.crop_lr is not None:
             lr, gt, mv_fwd, mv_bwd, res = self._random_crop(lr, gt, mv_fwd, mv_bwd, res)
@@ -209,8 +219,8 @@ class RedsMVSRDataset(Dataset):
         mv_fwd_t = torch.from_numpy(np.ascontiguousarray(mv_fwd)).float()  # (T,2,H,W)
         mv_bwd_t = torch.from_numpy(np.ascontiguousarray(mv_bwd)).float()  # (T,2,H,W)
         res_t    = torch.from_numpy(np.ascontiguousarray(res)).unsqueeze(1).float()  # (T,1,H,W)
-
-        return imgs, gts, mv_fwd_t, mv_bwd_t, res_t, clip, s
+        part_t = torch.from_numpy(np.ascontiguousarray(part)).long() # (T, H/16, W/16)
+        return imgs, gts, mv_fwd_t, mv_bwd_t, res_t, part_t, clip, s
 
     def __len__(self):
         return len(self.samples)
@@ -248,6 +258,22 @@ class CodecFlowHead(nn.Module):
             residual = residual.unsqueeze(1)
         x = torch.cat([mv, residual], dim=1)
         return self.net(x)
+
+class MVRefiner(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(2, 32, 3, 1, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 2, 3, 1, 1)
+        )
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, mv):
+        noise = self.net(mv)
+        return mv + noise
+
 class SFTResidualBlock(nn.Module):
     """
     Spatial Feature Transform (SFT) Residual Block.
@@ -276,6 +302,56 @@ class SFTResidualBlock(nn.Module):
         modulated_x = x * (1 + scale) + shift
         
         return x + self.body(modulated_x)
+    
+class PartitionMap(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.conv_large = nn.Sequential(
+            nn.Conv2d(dim, dim, 3, 1, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(dim, dim, 3, 1, 1)
+        )
+        
+        self.conv_inter = nn.Sequential(
+            nn.Conv2d(dim, dim, 3, 1, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(dim, dim, 3, 1, 1)
+        )
+        
+        self.conv_small = nn.Sequential(
+            nn.Conv2d(dim, dim, 3, 1, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(dim, dim, 3, 1, 1)
+        )
+
+    def forward(self, x, partition_map):
+        """
+        x: (B, C, H, W)
+        partition_map: (B, H_map, W_map) Integer tensor {0, 1, 2}
+        """
+        B, C, H, W = x.shape
+        
+        if partition_map.shape[-1] != W:
+            partition_map = F.interpolate(
+                partition_map.unsqueeze(1).float(), 
+                size=(H, W), 
+                mode='nearest'
+            ).squeeze(1).long()
+            
+        # mask_large: 1 where map==0 (16x16 blocks)
+        mask_large = (partition_map == 0).float().unsqueeze(1)
+        
+        # mask_inter: 1 where map==1 (16x8 / 8x16 blocks)
+        mask_inter = (partition_map == 1).float().unsqueeze(1)
+        
+        # mask_small: 1 where map==2 (8x8 and smaller)
+        mask_small = (partition_map >= 2).float().unsqueeze(1)
+
+        out_large = self.conv_large(x) * mask_large
+        out_inter = self.conv_inter(x) * mask_inter
+        out_small = self.conv_small(x) * mask_small
+        
+        return x + out_large + out_inter + out_small
 
 class MVWarp(nn.Module):
     def __init__(self, align_corners=True):
@@ -366,124 +442,112 @@ class MVSR(nn.Module):
         self.blocks = blocks
         self.scale = scale
 
-        self.conditioner = CodecConditioner(out_ch=mid)
+        # self.conditioner = CodecConditioner(out_ch=mid)
 
-        self.conv_first = nn.Conv2d(3, mid, 3, 1, 1)
-        self.relu = nn.ReLU(inplace=True)
+        # self.conv_first = nn.Conv2d(3, mid, 3, 1, 1)
+        # self.relu = nn.ReLU(inplace=True)
         
-        self.sft_blocks = nn.ModuleList([SFTResidualBlock(mid) for _ in range(blocks)])
+        # self.sft_blocks = nn.ModuleList([SFTResidualBlock(mid) for _ in range(blocks)])
 
         self.mvwarp = MVWarp(align_corners=True)
         
-        self.flow_head_fwd = ResidualFlowHead(c_feat=mid, hidden=64)
-        self.flow_head_bwd = ResidualFlowHead(c_feat=mid, hidden=64)
+        # self.flow_head_fwd = ResidualFlowHead(c_feat=mid, hidden=64)
+        # self.flow_head_bwd = ResidualFlowHead(c_feat=mid, hidden=64)
         
-        self.prop_fwd = nn.Sequential(
-            nn.Conv2d(mid * 2 + 1, mid, 3, 1, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(mid, mid, 3, 1, 1)
-        )
-        self.prop_bwd = nn.Sequential(
-            nn.Conv2d(mid * 2 + 1, mid, 3, 1, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(mid, mid, 3, 1, 1)
+        self.feat_extract = nn.Sequential(
+            nn.Conv2d(3, mid, 3, 1, 1),
+            nn.LeakyReLU(0.1, True),
+            nn.Conv2d(mid, mid, 3, 1, 1),
+            nn.LeakyReLU(0.1, True)
         )
         
-        self.fusion = nn.Conv2d(mid * 3 + 1, mid, 3, 1, 1)
+        self.mv_refiner = MVRefiner()
+        
+        self.backward_resblocks = nn.Sequential(*[ResidualBlock(mid) for _ in range(blocks)])
+        self.forward_resblocks = nn.Sequential(*[ResidualBlock(mid) for _ in range(blocks)])
+        
+        # self.prop_fwd = nn.Sequential(
+        #     nn.Conv2d(mid * 2 + 1, mid, 3, 1, 1),
+        #     nn.ReLU(inplace=True),
+        #     nn.Conv2d(mid, mid, 3, 1, 1)
+        # )
+        # self.prop_bwd = nn.Sequential(
+        #     nn.Conv2d(mid * 2 + 1, mid, 3, 1, 1),
+        #     nn.ReLU(inplace=True),
+        #     nn.Conv2d(mid, mid, 3, 1, 1)
+        # )
+        
+        self.partion_map = PartitionMap(mid)
+        
+        self.fusion = nn.Conv2d(mid * 2, mid, 1, 1)
         
         self.up = nn.Sequential(
             nn.Conv2d(mid, mid * 4, 3, 1, 1),
             nn.PixelShuffle(2),
-            nn.ReLU(inplace=True),
+            nn.LeakyReLU(0.1, True),
             nn.Conv2d(mid, mid * 4, 3, 1, 1),
             nn.PixelShuffle(2),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(mid, 3, 3, 1, 1),
+            nn.LeakyReLU(0.1, True),
+            nn.Conv2d(mid, 3, 3, 1, 1)
         )
 
-    def extract_features(self, lr_imgs, conds):
-        # lr_imgs: (B, T, 3, H, W)
-        # conds:   (B, T, mid, H, W)
-        B, T, _, H, W = lr_imgs.shape
+    def compute_flow(self, mv):
+        return self.mv_refiner(mv / 4.0)
+
+    # def extract_features(self, lr_imgs, conds):
+    #     # lr_imgs: (B, T, 3, H, W)
+    #     # conds:   (B, T, mid, H, W)
+    #     B, T, _, H, W = lr_imgs.shape
         
-        # Flatten T into B
-        x = lr_imgs.view(B*T, 3, H, W)
-        c = conds.view(B*T, self.mid, H, W)
+    #     x = lr_imgs.view(B*T, 3, H, W)
+    #     c = conds.view(B*T, self.mid, H, W)
         
-        feat = self.relu(self.conv_first(x))
+    #     feat = self.relu(self.conv_first(x))
         
-        # Pass through SFT blocks
-        for block in self.sft_blocks:
-            feat = block(feat, c)
+    #     for block in self.sft_blocks:
+    #         feat = block(feat, c)
             
-        return feat.view(B, T, self.mid, H, W)
+    #     return feat.view(B, T, self.mid, H, W)
 
-    def forward(self, imgs, mv_fwd, mv_bwd, residual):
-        """
-        imgs:     (B,T,3,H,W)
-        mv_fwd:   (B,T,2,H,W)
-        mv_bwd:   (B,T,2,H,W)
-        residual: (B,T,1,H,W)
-        """
-        B, T, _, H, W = imgs.shape
+    def forward(self, imgs, mv_fwd, mv_bwd, residual, partition_maps):
+        B, T, C, H, W = imgs.shape
         
-        mv_mag_combined = (mv_fwd + mv_bwd) / 2.0
+        # Extract Features
+        feats = self.feat_extract(imgs.view(-1, C, H, W)).view(B, T, -1, H, W)
         
-        res_flat = residual.view(B*T, 1, H, W)
-        mv_flat  = mv_mag_combined.view(B*T, 2, H, W)
+        bwd_features = []
+        h_bwd = torch.zeros_like(feats[:, 0])
         
-        conds = self.conditioner(res_flat, mv_flat).view(B, T, self.mid, H, W)
-        
-        feats = self.extract_features(imgs, conds)
-
-        h_fwd = None
-        fwd_feats = []
-
-        for t in range(T):
-            feat_t = feats[:, t]
-            
-            if h_fwd is None:
-                h_fwd = feat_t
-            else:
-                flow_fwd = self.flow_head_fwd(h_fwd, feat_t)
-                warped_h, mask = self.mvwarp(h_fwd, flow_fwd)
-                
-                x_fwd = torch.cat([feat_t, warped_h, mask], dim=1)
-                h_fwd = self.prop_fwd(x_fwd)
-            
-            fwd_feats.append(h_fwd)
-
-        h_bwd = None
-        bwd_feats = []
-
         for t in range(T - 1, -1, -1):
-            feat_t = feats[:, t]
+            flow = self.compute_flow(mv_bwd[:, t]) 
+            h_bwd = self.warper(h_bwd, flow)
             
-            if h_bwd is None:
-                h_bwd = feat_t
-            else:
-                flow_bwd = self.flow_head_bwd(h_fwd, feat_t)
-                warped_h, mask = self.mvwarp(h_bwd, flow_bwd)
-                
-                x_bwd = torch.cat([feat_t, warped_h, mask], dim=1)
-                h_bwd = self.prop_bwd(x_bwd)
-                
-            bwd_feats.append(h_bwd)
+            h_bwd = h_bwd + feats[:, t]
+            h_bwd = self.backward_resblocks(h_bwd)
+            bwd_features.append(h_bwd)
+        bwd_features = bwd_features[::-1]
 
-        bwd_feats = bwd_feats[::-1]
+        fwd_features = []
+        h_fwd = torch.zeros_like(feats[:, 0])
+        
+        for t in range(T):
+            flow = self.compute_flow(mv_fwd[:, t])
+            h_fwd = self.warper(h_fwd, flow)
+            
+            h_fwd = h_fwd + feats[:, t]
+            h_fwd = self.forward_resblocks(h_fwd)
+            fwd_features.append(h_fwd)
 
         outs = []
         for t in range(T):
-            feat_t = feats[:, t]
-            res_t  = residual[:, t]
-            if res_t.dim() == 3: res_t = res_t.unsqueeze(1)
+            fused = self.fusion(torch.cat([fwd_features[t], bwd_features[t]], dim=1))
+            
+            refined = self.partion_map(fused, partition_maps[:, t])
+            
+            out = self.up(refined)
+            outs.append(out)
 
-            fuse_in = torch.cat([fwd_feats[t], bwd_feats[t], feat_t, res_t], dim=1)
-            fused = self.fusion(fuse_in)
-            sr_t = self.up(fused)
-            outs.append(sr_t)
-
-        return torch.stack(outs, dim=1) # (B,T,3,4H,4W)
+        return torch.stack(outs, dim=1)
 
 # ------------------------ Train / Val ------------------------
 
@@ -491,15 +555,16 @@ class MVSR(nn.Module):
 def evaluate(model, loader, device, amp_dtype=torch.float16):
     model.eval()
     psnr_sum, ncount = 0.0, 0
-    for imgs, gts, mv_fwd, mv_bwd, residual, _, _ in tqdm(loader, desc="val", leave=False):
+    for imgs, gts, mv_fwd, mv_bwd, residual, partition_maps, _, _ in tqdm(loader, desc="val", leave=False):
         imgs     = imgs.to(device, non_blocking=True)       # (B,T,3,H,W)
         gts      = gts.to(device, non_blocking=True)        # (B,T,3,4H,4W)
         mv_fwd   = mv_fwd.to(device, non_blocking=True)     # (B,T,2,H,W)
         mv_bwd   = mv_bwd.to(device, non_blocking=True)     # (B,T,2,H,W)
         residual = residual.to(device, non_blocking=True)   # (B,T,1,H,W)
+        partition_maps = partition_maps.to(device, non_blocking=True)
 
         with torch.autocast(device_type="cuda", dtype=amp_dtype):
-            sr = model(imgs, mv_fwd, mv_bwd, residual)
+            sr = model(imgs, mv_fwd, mv_bwd, residual, partition_maps)
 
         psnr_sum += float(psnr_torch_perframe(sr, gts)) * imgs.size(0)
         ncount   += imgs.size(0)
@@ -594,18 +659,18 @@ def main():
     for epoch in range(1, args.epochs + 1):
         model.train()
         pbar = tqdm(train_loader, desc=f"Train epoch {epoch}")
-        for imgs, gts, mv_fwd, mv_bwd, residual, _, _ in pbar:
-            imgs     = imgs.to(device, non_blocking=True)
-            gts      = gts.to(device, non_blocking=True)
-            mv_fwd   = mv_fwd.to(device, non_blocking=True)
-            mv_bwd   = mv_bwd.to(device, non_blocking=True)
-            residual = residual.to(device, non_blocking=True)
+        for imgs, gts, mv_fwd, mv_bwd, residual, partition_maps, _, _ in pbar:
+            imgs           = imgs.to(device, non_blocking=True)
+            gts            = gts.to(device, non_blocking=True)
+            mv_fwd         = mv_fwd.to(device, non_blocking=True)
+            mv_bwd         = mv_bwd.to(device, non_blocking=True)
+            residual       = residual.to(device, non_blocking=True)
+            partition_maps = partition_maps.to(device, non_blocking=True)
 
             opt.zero_grad(set_to_none=True)
             with torch.autocast(device_type="cuda", dtype=amp_dtype):
-                sr = model(imgs, mv_fwd, mv_bwd, residual)
+                sr = model(imgs, mv_fwd, mv_bwd, residual, partition_maps)
                 loss = charbonnier_loss(sr, gts)
-
 
             scaler.scale(loss).backward()
             scaler.step(opt)

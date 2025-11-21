@@ -443,7 +443,7 @@ class MVSR(nn.Module):
         
         # self.sft_blocks = nn.ModuleList([SFTResidualBlock(mid) for _ in range(blocks)])
 
-        self.mvwarp = MVWarp(align_corners=True)
+        self.mvwarp = MVWarp()
         
         # self.flow_head_fwd = ResidualFlowHead(c_feat=mid, hidden=64)
         # self.flow_head_bwd = ResidualFlowHead(c_feat=mid, hidden=64)

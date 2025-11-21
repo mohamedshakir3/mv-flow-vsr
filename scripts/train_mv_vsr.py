@@ -354,35 +354,29 @@ class PartitionMap(nn.Module):
         return x + out_large + out_inter + out_small
 
 class MVWarp(nn.Module):
-    def __init__(self, align_corners=True):
+    def __init__(self):
         super().__init__()
-        self.align_corners = align_corners
-        self.register_buffer("_base", None, persistent=False)  # (1,H,W,2)
+        self.register_buffer("_base", None, persistent=False)
 
     def _grid(self, H, W, device):
-        g = self._base
-        if g is None or g.shape[1] != H or g.shape[2] != W or g.device != device:
+        if self._base is None or self._base.shape[1] != H or self._base.shape[2] != W:
             xs = torch.linspace(-1, 1, W, device=device)
             ys = torch.linspace(-1, 1, H, device=device)
             yy, xx = torch.meshgrid(ys, xs, indexing='ij')
-            g = torch.stack([xx, yy], dim=-1).unsqueeze(0)  # (1,H,W,2)
-            self._base = g
-        return g
+            self._base = torch.stack([xx, yy], dim=-1).unsqueeze(0)
+        return self._base
 
-    def forward(self, feat_tm1, flow_pix):
-        # feat_tm1: (B,C,H,W) ; flow_pix: (B,2,H,W) backward t<-t-1 in pixels
-        B, C, H, W = feat_tm1.shape
-        base = self._grid(H, W, feat_tm1.device)
-        sx = 2.0 / max(W - 1, 1); sy = 2.0 / max(H - 1, 1)
-        nx = flow_pix[:, 0] * sx; ny = flow_pix[:, 1] * sy
-        grid = torch.stack([base[..., 0] + nx, base[..., 1] + ny], dim=-1)  # (B,H,W,2)
-        warped = F.grid_sample(feat_tm1, grid, mode='bilinear',
-                               padding_mode="zeros", align_corners=self.align_corners)
-        valid = ((grid[..., 0] > -1) & (grid[..., 0] < 1) &
-                 (grid[..., 1] > -1) & (grid[..., 1] < 1)).unsqueeze(1).float()
-        mag = torch.linalg.vector_norm(flow_pix, dim=1, keepdim=True)
-        conf = valid * torch.exp(-(mag / 8.0) ** 2)
-        return warped, conf
+    def forward(self, x, flow):
+        # flow is in pixels (B, 2, H, W)
+        B, C, H, W = x.shape
+        grid = self._grid(H, W, x.device)
+        
+        vgrid = grid + torch.stack([
+            flow[:, 0] * (2.0 / (W - 1)), 
+            flow[:, 1] * (2.0 / (H - 1))
+        ], dim=-1)
+        
+        return F.grid_sample(x, vgrid, mode='bilinear', padding_mode='border', align_corners=True)
 
 class CodecConditioner(nn.Module):
     """

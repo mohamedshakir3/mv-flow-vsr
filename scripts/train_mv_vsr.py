@@ -554,7 +554,7 @@ def evaluate(model, loader, device, amp_dtype=torch.float16):
         gts      = gts.to(device, non_blocking=True)        # (B,T,3,4H,4W)
         mv_fwd   = mv_fwd.to(device, non_blocking=True)     # (B,T,2,H,W)
         mv_bwd   = mv_bwd.to(device, non_blocking=True)     # (B,T,2,H,W)
-        residual = residual.to(device, non_blocking=True)   # (B,T,1,H,W)
+        # residual = residual.to(device, non_blocking=True)   # (B,T,1,H,W)
         partition_maps = partition_maps.to(device, non_blocking=True)
 
         with torch.autocast(device_type="cuda", dtype=amp_dtype):
@@ -658,7 +658,7 @@ def main():
             gts            = gts.to(device, non_blocking=True)
             mv_fwd         = mv_fwd.to(device, non_blocking=True)
             mv_bwd         = mv_bwd.to(device, non_blocking=True)
-            residual       = residual.to(device, non_blocking=True)
+            # residual       = residual.to(device, non_blocking=True)
             partition_maps = partition_maps.to(device, non_blocking=True)
 
             opt.zero_grad(set_to_none=True)

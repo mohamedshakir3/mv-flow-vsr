@@ -584,8 +584,8 @@ def main():
     ap.add_argument("--batch", type=int, default=24)
     ap.add_argument("--epochs", type=int, default=50)
     ap.add_argument("--lr", type=float, default=2e-4)
-    ap.add_argument("--lambda_l1", type=float, default=0.05,
-                        help="Weight for the L1 sparsity loss on residual flow")
+    ap.add_argument("--ckpt", type=bool, default=False)
+    
     args = ap.parse_args()
     with open(args.cfg, "r") as f:
         cfg = yaml.safe_load(f) or {}
@@ -639,6 +639,19 @@ def main():
     )
 
     model = MVSR(mid=64, blocks=15, scale=args.scale).to(device)
+    checkpoint_path = os.path.join(args.out_dir, "best.pth")
+    
+    if args.ckpt:
+        print(f"--- Loading weights from {checkpoint_path} ---")
+        
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        
+        model.load_state_dict(checkpoint, strict=False)
+        
+        print("--- Weights loaded successfully ---")
+    else:
+        print(f"--- No checkpoint found at {checkpoint_path}, starting from scratch ---")
+
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.99))
     scaler = torch.amp.GradScaler()

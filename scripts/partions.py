@@ -2,7 +2,6 @@ import os
 import numpy as np
 import pandas as pd
 import av
-import argparse
 from pathlib import Path
 from tqdm import tqdm
 

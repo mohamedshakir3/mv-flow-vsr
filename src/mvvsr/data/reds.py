@@ -1,156 +1,219 @@
-# encode_pyav.py
-import os, cv2, av
+import os, glob, random
 import numpy as np
-import subprocess
-from pathlib import Path
-from PIL import Image
-import csv
+import cv2
+import torch
+from torch.utils.data import Dataset
 
 
-def encode_folder_to_h264(input_folder: str, out_path: str, fps: int = 24, crf: int = 26):
-    names = sorted([n for n in os.listdir(input_folder)
-                    if n.lower().endswith((".png", ".jpg", ".jpeg"))])
-    assert names, f"No images in {input_folder}"
-    first = cv2.imread(os.path.join(input_folder, names[0]))
-    h, w = first.shape[:2]
+def imread_rgb(p):
+    bgr = cv2.imread(p, cv2.IMREAD_COLOR)
+    if bgr is None:
+        raise FileNotFoundError(p)
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
-    out = av.open(out_path, mode="w")
-    stream = out.add_stream("libx264", rate=fps)
-    stream.width = w
-    stream.height = h
-    stream.pix_fmt = "yuv420p"
-    stream.codec_context.gop_size = 999
-    stream.codec_context.max_b_frames = 0
-    stream.codec_context.options = {
-        "crf": str(crf),
-        "preset": "slow",
-        "sc_threshold": "0"                 # avoid surprise I-frames
-    }
+def to_tensor01(img):
+    if not img.flags['C_CONTIGUOUS']:
+        img = np.ascontiguousarray(img)
+    return torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
 
-    for n in names:
-        img = cv2.imread(os.path.join(input_folder, n))
-        if img.shape[:2] != (h, w):
-            img = cv2.resize(img, (w, h))
-        frame = av.VideoFrame.from_ndarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), format="rgb24")
-        for pkt in stream.encode(frame):
-            out.mux(pkt)
+@torch.no_grad()
+def psnr_torch_perframe(x, y, eps=1e-12):
+    """x,y: (B,T,C,H,W) -> mean PSNR over (B,T)"""
+    mse = ((x - y) ** 2).mean(dim=(2, 3, 4)).clamp_min(eps)
+    return (10.0 * torch.log10(1.0 / mse)).mean()
 
-    for pkt in stream.encode(None):
-        out.mux(pkt)
-    out.close()
+def charbonnier_loss(x, y, eps=1e-3):
+    return torch.mean(torch.sqrt((x - y) ** 2 + eps ** 2))
 
-def extract_mvs(clip: str, output: str):
-    cmd = ["./extract_mvs", clip]
-    with open(output, "w") as f:
-        subprocess.run(cmd, stdout=f, text=True, check=True)
-
-def csv_to_npz_flows(csv_path: str, lr_frames_dir: str, out_dir: str):
+class RedsMVSRDataset(Dataset):
     """
-    Reads CSV rows like:
-      framenum,source,blockw,blockh,srcx,srcy,dstx,dsty,flags,motion_x,motion_y,motion_scale
-    Keeps only backward refs (source in {-1,0}), converts to pixel flow (dx,dy),
-    rasterizes to a dense field per frame, and writes:
-      out_dir/{t:06d}_mv.npz  with key 'flow_bwd' -> (H,W,2) float32
+    REDS GT + codec-aware LR data (LR + bidirectional MVs + residuals).
+
+    Layout:
+      reds_root/
+        train_sharp/<clip>/*.png   (GT)
+        val_sharp/<clip>/*.png
+      codec_root/
+        <clip>/
+          lr/*.png
+          mv_fwd/*.npz   (flow_fwd: (2,H,W), for frame index t)
+          mv_bwd/*.npz   (flow_bwd: (2,H,W), for frame index t)
+          residual/*.npy (residual for frame index t, t>0)
     """
-    out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
-    # Infer LR H,W and frame count from the images
-    lr_imgs = sorted([p for p in os.listdir(lr_frames_dir)
-                      if p.lower().endswith((".png",".jpg",".jpeg"))])
-    if not lr_imgs:
-        raise RuntimeError(f"No LR frames found in {lr_frames_dir}")
-    H, W = Image.open(os.path.join(lr_frames_dir, lr_imgs[0])).size[::-1]
-    T = len(lr_imgs)
+    def __init__(self, reds_root, codec_root, split,
+                 scale=4, seq_len=5, crop_lr=None, augment=False,
+                 img_tmpl="{:08d}.png"):
+        assert split in ("train", "val", "test")
+        self.scale = scale
+        self.seq_len = seq_len
+        self.crop_lr = crop_lr
+        self.augment = augment
+        self.img_tmpl = img_tmpl
 
-    # Read CSV and bucket blocks per frame index
-    by_frame = {}
-    min_fr = None
-    with open(csv_path, newline="") as f:
-        r = csv.DictReader(f)
-        for row in r:
-            try:
-                src = int(row["source"])
-            except KeyError:
-                # Some builds use 'source' or 'source' missing; fallback to -1 (backward)
-                src = -1
-            if src not in (-1, 0):  # keep backward list only
-                continue
-            fr = int(row["framenum"])
-            bw, bh = int(row["blockw"]), int(row["blockh"])
-            x0, y0 = int(row["dstx"]), int(row["dsty"])
-            # fixed-point -> pixels
-            mscale = float(row.get("motion_scale", 1) or 1)
-            dx = int(row["motion_x"]) / mscale
-            dy = int(row["motion_y"]) / mscale
-            if fr not in by_frame:
-                by_frame[fr] = []
-            by_frame[fr].append((x0, y0, bw, bh, dx, dy))
-            if min_fr is None or fr < min_fr:
-                min_fr = fr
+        self.gt_root = os.path.join(reds_root, f"{split}_sharp")
+        self.codec_root = codec_root
 
-    # Align CSV frame numbering to 0..T-1 (CSV may start at 1)
-    offset = int(min_fr) if min_fr is not None else 0
+        self.clips = sorted([
+            d for d in os.listdir(self.codec_root)
+            if os.path.isdir(os.path.join(self.codec_root, d))
+        ])
 
-    # Build/save dense flow per LR frame index t (0..T-1)
-    for t in range(T):
-        flow = np.zeros((H, W, 2), np.float32)
-        cover = np.zeros((H, W), np.int32)
-        blocks = by_frame.get(t + offset, [])
-        for x0, y0, bw, bh, dx, dy in blocks:
-            x0c = max(0, x0); y0c = max(0, y0)
-            x1 = min(W, x0c + bw); y1 = min(H, y0c + bh)
-            if x0c >= x1 or y0c >= y1:
-                continue
-            flow[y0c:y1, x0c:x1, 0] += dx
-            flow[y0c:y1, x0c:x1, 1] += dy
-            cover[y0c:y1, x0c:x1] += 1
+        self.samples = []
+        for clip in self.clips:
+            lr_dir = os.path.join(self.codec_root, clip, "lr")
+            T = len(glob.glob(os.path.join(lr_dir, "*.png")))
+            if T >= seq_len:
+                for s in range(0, T - seq_len + 1):
+                    self.samples.append((clip, s))
 
-        m = cover > 0
-        if m.any():
-            flow[m, 0] /= cover[m]
-            flow[m, 1] /= cover[m]
+        if not self.samples:
+            raise RuntimeError("No samples found. Check codec_root and seq_len.")
 
-        np.savez_compressed(out / f"{t:06d}_mv.npz", flow_bwd=flow)
-
-if __name__ == "__main__":
-    training_set_path = "/Volumes/workspace/mohamed/data/REDS/val/val_sharp_bicubic/X4/"
-    encodings_path = "./val_encodings/"
-    mv_csv_path    = "./val_MVs/"
-    flows_root     = "./val_flows/"
-
-    Path(encodings_path).mkdir(parents=True, exist_ok=True)
-    Path(mv_csv_path).mkdir(parents=True, exist_ok=True)
-    Path(flows_root).mkdir(parents=True, exist_ok=True)
-
-    for frame_dir in sorted(os.listdir(training_set_path)):
-        lr_seq_dir   = os.path.join(training_set_path, frame_dir)
-        if not os.path.isdir(lr_seq_dir):
-            continue
-
-        encoded_clip = os.path.join(encodings_path, f"{frame_dir}.mp4")
-        mv_csv       = os.path.join(mv_csv_path, f"{frame_dir}.csv")
-        flows_dir    = os.path.join(flows_root, frame_dir)
-
-        print(f"[{frame_dir}] encoding LR -> {encoded_clip}")
-        encode_folder_to_h264(lr_seq_dir, encoded_clip)
-
-        print(f"[{frame_dir}] extracting MVs -> {mv_csv}")
-        extract_mvs(encoded_clip, mv_csv)
-
-        print(f"[{frame_dir}] rasterizing CSV -> flows (*.npz) in {flows_dir}")
-        csv_to_npz_flows(mv_csv, lr_seq_dir, flows_dir)
-# if __name__ == "__main__":
-#     training_set_path = "/Volumes/workspace/mohamed/data/REDS/train/train_sharp_bicubic/X4/"
-#     encodings_path = "./encodings/"
-#     mv_path = "./MVs/"
-#     for frame_dir in sorted(os.listdir(training_set_path)):
-#         encoded_clip = encodings_path + frame_dir + ".mp4"
-#         input_path = training_set_path + frame_dir
-#         encode_folder_to_h264(input_path, encoded_clip)
-#         motion_vectors = mv_path + frame_dir + ".csv"
-#         extract_mvs(encoded_clip, motion_vectors)
-#     # for clip in sorted(os.listdir("./encodings")):
-#     #     encoded_clip = encodings_path + clip
-#     #     motion_vectors = mv_path + clip.split(".")[0] + ".csv"
-#     #     extract_mvs(encoded_clip, motion_vectors)
+    def _load_seq(self, clip, start):
+        """
+        Load LR, GT, mv_fwd, mv_bwd, residual for a window [start, start+seq_len).
+        """
+        lr_dir   = os.path.join(self.codec_root, clip, "lr")
+        mvf_dir  = os.path.join(self.codec_root, clip, "mv_fwd")
+        mvb_dir  = os.path.join(self.codec_root, clip, "mv_bwd")
+        res_dir  = os.path.join(self.codec_root, clip, "residual")
+        gt_dir   = os.path.join(self.gt_root, clip)
+        part_dir = os.path.join(self.codec_root, clip, "partition_maps")
         
-        
+
+        imgs_lr, imgs_gt = [], []
+        mv_fwd_list, mv_bwd_list, res_list, part_list = [], [], [], []
+
+        for t in range(start, start + self.seq_len):
+            fn = self.img_tmpl.format(t)
+            # LR frame
+            lr_path = os.path.join(lr_dir, fn)
+            imgs_lr.append(imread_rgb(lr_path))
+            # GT frame
+            gt_path = os.path.join(gt_dir, fn)
+            imgs_gt.append(imread_rgb(gt_path))
+
+        lr_arr = np.stack(imgs_lr, axis=0)  # (T,H,W,3)
+        gt_arr = np.stack(imgs_gt, axis=0)  # (T,4H,4W,3)
+        T, H, W, _ = lr_arr.shape
+
+        for t in range(start, start + self.seq_len):
+            base = self.img_tmpl.format(t)
+            stem = os.path.splitext(base)[0]  # "00000010"
+
+            if t == 0:
+                mvf = np.zeros((2, H, W), np.float32)
+            else:
+                p_fwd = os.path.join(mvf_dir, f"{stem}_mv_fwd.npz")
+                if os.path.exists(p_fwd):
+                    f = np.load(p_fwd)["flow_fwd"].astype(np.float32)  # (2,H,W) or (H,W,2)
+                    if f.ndim == 3 and f.shape[0] != 2:
+                        # if stored as (H,W,2), transpose
+                        f = np.transpose(f, (2, 0, 1))
+                    mvf = f
+                else:
+                    mvf = np.zeros((2, H, W), np.float32)
+            mv_fwd_list.append(mvf)
+
+            p_bwd = os.path.join(mvb_dir, f"{stem}_mv_bwd.npz")
+            if os.path.exists(p_bwd):
+                b = np.load(p_bwd)["flow_bwd"].astype(np.float32)
+                if b.ndim == 3 and b.shape[0] != 2:
+                    b = np.transpose(b, (2, 0, 1))
+                mvb = b
+            else:
+                mvb = np.zeros((2, H, W), np.float32)
+            mv_bwd_list.append(mvb)
+            
+            p_part = os.path.join(part_dir, f"{stem}_part.npy")
+            if os.path.exists(p_part):
+                pmap = np.load(p_part).astype(np.int64) 
+            else:
+                pmap = np.full((H//16, W//16), 2, dtype=np.int64)
+            part_list.append(pmap)
+
+            if t == 0:
+                res = np.zeros((H, W), np.float32)
+            else:
+                p_res = os.path.join(res_dir, f"{stem}_res.npy")
+                if os.path.exists(p_res):
+                    res = np.load(p_res).astype(np.float32)  # (H,W)
+                else:
+                    res = np.zeros((H, W), np.float32)
+            res_list.append(res)
+
+        part_arr = np.stack(part_list, axis=0) # (T, H/16, W/16)
+        mv_fwd_arr = np.stack(mv_fwd_list, axis=0)  # (T,2,H,W)
+        mv_bwd_arr = np.stack(mv_bwd_list, axis=0)  # (T,2,H,W)
+        res_arr    = np.stack(res_list,    axis=0)  # (T,H,W)
+
+        return lr_arr, gt_arr, mv_fwd_arr, mv_bwd_arr, res_arr, part_arr
+
+    def _random_crop(self, lr, gt, mv_fwd, mv_bwd, res):
+        T, H, W, _ = lr.shape
+        ch = cw = self.crop_lr
+        if ch is None or H < ch or W < cw:
+            return lr, gt, mv_fwd, mv_bwd, res
+        y0 = random.randint(0, H - ch)
+        x0 = random.randint(0, W - cw)
+
+        lr = lr[:, y0:y0+ch, x0:x0+cw, :]
+        gt = gt[:, y0*self.scale:(y0+ch)*self.scale,
+                   x0*self.scale:(x0+cw)*self.scale, :]
+
+        mv_fwd = mv_fwd[:, :, y0:y0+ch, x0:x0+cw]
+        mv_bwd = mv_bwd[:, :, y0:y0+ch, x0:x0+cw]
+        res    = res[:, y0:y0+ch, x0:x0+cw]
+
+        return lr, gt, mv_fwd, mv_bwd, res
+
+    def _augment(self, lr, gt, mv_fwd, mv_bwd, res):
+        if random.random() < 0.5:
+            lr  = lr[:, :, ::-1]
+            gt  = gt[:, :, ::-1]
+            res = res[:, :, ::-1]
+            mv_fwd = mv_fwd[:, :, :, ::-1]
+            mv_bwd = mv_bwd[:, :, :, ::-1]
+            mv_fwd[:, 0] *= -1.0
+            mv_bwd[:, 0] *= -1.0
+
+        if random.random() < 0.5:
+            lr  = lr[:, ::-1, :]
+            gt  = gt[:, ::-1, :]
+            res = res[:, ::-1, :]
+            mv_fwd = mv_fwd[:, :, ::-1, :]
+            mv_bwd = mv_bwd[:, :, ::-1, :]
+            mv_fwd[:, 1] *= -1.0
+            mv_bwd[:, 1] *= -1.0
+
+        if random.random() < 0.5:
+            lr  = lr.transpose(0, 2, 1, 3)
+            gt  = gt.transpose(0, 2, 1, 3)
+            res = res.transpose(0, 2, 1)
+            mv_fwd = mv_fwd.transpose(0, 1, 3, 2)
+            mv_bwd = mv_bwd.transpose(0, 1, 3, 2)
+            mv_fwd = mv_fwd[:, [1, 0]]
+            mv_bwd = mv_bwd[:, [1, 0]]
+
+        return lr, gt, mv_fwd, mv_bwd, res
+
+    def __getitem__(self, idx):
+        clip, s = self.samples[idx]
+        lr, gt, mv_fwd, mv_bwd, res, part = self._load_seq(clip, s)
+
+        if self.crop_lr is not None:
+            lr, gt, mv_fwd, mv_bwd, res = self._random_crop(lr, gt, mv_fwd, mv_bwd, res)
+        if self.augment:
+            lr, gt, mv_fwd, mv_bwd, res = self._augment(lr, gt, mv_fwd, mv_bwd, res)
+
+        imgs = torch.stack([to_tensor01(im) for im in lr], dim=0)  # (T,3,H,W)
+        gts  = torch.stack([to_tensor01(im) for im in gt], dim=0)  # (T,3,4H,4W)
+
+        mv_fwd_t = torch.from_numpy(np.ascontiguousarray(mv_fwd)).float()  # (T,2,H,W)
+        mv_bwd_t = torch.from_numpy(np.ascontiguousarray(mv_bwd)).float()  # (T,2,H,W)
+        res_t    = torch.from_numpy(np.ascontiguousarray(res)).unsqueeze(1).float()  # (T,1,H,W)
+        part_t = torch.from_numpy(np.ascontiguousarray(part)).long() # (T, H/16, W/16)
+        return imgs, gts, mv_fwd_t, mv_bwd_t, res_t, part_t, clip, s
+
+    def __len__(self):
+        return len(self.samples)

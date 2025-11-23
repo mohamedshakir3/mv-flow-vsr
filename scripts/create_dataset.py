@@ -1,13 +1,10 @@
-#!/usr/bin/env python3
-import os
 import csv
 import argparse
 import subprocess
 from pathlib import Path
-
 import numpy as np
 import cv2
-import av  # pip install av
+import av
 
 
 def run_ffmpeg_encode(hr_dir: Path, out_video: Path,
@@ -130,13 +127,11 @@ def extract_codec_features(
     out_mv_bwd_dir.mkdir(parents=True, exist_ok=True)
     out_res_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1) Get basic video info: width, height, n_frames
     container = av.open(str(video_path))
     stream = container.streams.video[0]
     width = stream.codec_context.width
     height = stream.codec_context.height
 
-    # Count frames (we'll reopen later)
     n_frames = 0
     for _ in container.decode(video=0):
         n_frames += 1
@@ -144,17 +139,14 @@ def extract_codec_features(
 
     print(f"Video {video_path.name}: {width}x{height}, {n_frames} frames")
 
-    # 2) Run C mv extractor -> CSV
     csv_path = video_path.with_suffix(".mvs.csv")
     cmd = [str(mv_extractor), str(video_path)]
     print("Running MV extractor:", " ".join(cmd))
     with csv_path.open("w") as f:
         subprocess.run(cmd, stdout=f, check=True)
 
-    # 3) Parse CSV into dense forward/backward flow fields
     per_frame_fwd, per_frame_bwd = parse_mvs_csv(csv_path, height, width)
 
-    # 4) Decode frames again with PyAV to save PNGs + residuals
     container = av.open(str(video_path))
     prev_frame_rgb = None
 
@@ -167,7 +159,6 @@ def extract_codec_features(
         lr_path = out_lr_dir / f"{i:08d}.png"
         cv2.imwrite(str(lr_path), cv2.cvtColor(img, cv2.COLOR_RGB2BGR))        
 
-        # Get forward/backward flows for this frame (if any)
         flow_fwd = per_frame_fwd.get(i, np.zeros((2, h, w), dtype=np.float32))
         flow_bwd = per_frame_bwd.get(i, np.zeros((2, h, w), dtype=np.float32))
 
@@ -175,7 +166,6 @@ def extract_codec_features(
             np.savez_compressed(out_mv_fwd_dir / f"{i:08d}_mv_fwd.npz", flow_fwd=flow_fwd)
             np.savez_compressed(out_mv_bwd_dir / f"{i:08d}_mv_bwd.npz", flow_bwd=flow_bwd)
 
-        # Residual map: |current - warp(prev, flow_fwd)|
         if i > 0 and prev_frame_rgb is not None:
             flow_x = flow_fwd[0]
             flow_y = flow_fwd[1]
@@ -270,7 +260,6 @@ def main():
         crf=args.crf,
         fps=args.fps,
     )
-
 
 if __name__ == "__main__":
     main()

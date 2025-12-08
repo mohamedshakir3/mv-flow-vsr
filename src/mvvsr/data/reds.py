@@ -27,7 +27,7 @@ def charbonnier_loss(x, y, eps=1e-3):
 
 class RedsMVSRDataset(Dataset):
     """
-    REDS GT + codec-aware LR data (LR + bidirectional MVs + residuals).
+    REDS GT + codec-aware LR data (LR + bidirectional MVs + Partition Maps).
 
     Layout:
       reds_root/
@@ -38,7 +38,7 @@ class RedsMVSRDataset(Dataset):
           lr/*.png
           mv_fwd/*.npz   (flow_fwd: (2,H,W), for frame index t)
           mv_bwd/*.npz   (flow_bwd: (2,H,W), for frame index t)
-          residual/*.npy (residual for frame index t, t>0)
+          partition_maps/*.npy  (H/16,W/16), for frame index t
     """
     def __init__(self, reds_root, codec_root, split,
                  scale=4, seq_len=5, crop_lr=None, augment=False,
@@ -76,13 +76,17 @@ class RedsMVSRDataset(Dataset):
         lr_dir   = os.path.join(self.codec_root, clip, "lr")
         mvf_dir  = os.path.join(self.codec_root, clip, "mv_fwd")
         mvb_dir  = os.path.join(self.codec_root, clip, "mv_bwd")
-        res_dir  = os.path.join(self.codec_root, clip, "residual")
         gt_dir   = os.path.join(self.gt_root, clip)
         part_dir = os.path.join(self.codec_root, clip, "partition_maps")
+        meta_dir = os.path.join(self.codec_root, clip, "meta")
         
 
         imgs_lr, imgs_gt = [], []
-        mv_fwd_list, mv_bwd_list, res_list, part_list = [], [], [], []
+        mv_fwd_list, mv_bwd_list, part_list = [], [], []
+        
+        ft_path = os.path.join(meta_dir, "frame_types.npy")
+        all_types = np.load(ft_path)
+        seq_types = all_types[start : start + self.seq_len]
 
         for t in range(start, start + self.seq_len):
             fn = self.img_tmpl.format(t)
@@ -108,7 +112,6 @@ class RedsMVSRDataset(Dataset):
                 if os.path.exists(p_fwd):
                     f = np.load(p_fwd)["flow_fwd"].astype(np.float32)  # (2,H,W) or (H,W,2)
                     if f.ndim == 3 and f.shape[0] != 2:
-                        # if stored as (H,W,2), transpose
                         f = np.transpose(f, (2, 0, 1))
                     mvf = f
                 else:
@@ -132,28 +135,19 @@ class RedsMVSRDataset(Dataset):
                 pmap = np.full((H//16, W//16), 2, dtype=np.int64)
             part_list.append(pmap)
 
-            if t == 0:
-                res = np.zeros((H, W), np.float32)
-            else:
-                p_res = os.path.join(res_dir, f"{stem}_res.npy")
-                if os.path.exists(p_res):
-                    res = np.load(p_res).astype(np.float32)  # (H,W)
-                else:
-                    res = np.zeros((H, W), np.float32)
-            res_list.append(res)
 
         part_arr = np.stack(part_list, axis=0) # (T, H/16, W/16)
         mv_fwd_arr = np.stack(mv_fwd_list, axis=0)  # (T,2,H,W)
         mv_bwd_arr = np.stack(mv_bwd_list, axis=0)  # (T,2,H,W)
-        res_arr    = np.stack(res_list,    axis=0)  # (T,H,W)
+        
 
-        return lr_arr, gt_arr, mv_fwd_arr, mv_bwd_arr, res_arr, part_arr
+        return lr_arr, gt_arr, mv_fwd_arr, mv_bwd_arr, part_arr, seq_types
 
-    def _random_crop(self, lr, gt, mv_fwd, mv_bwd, res):
+    def _random_crop(self, lr, gt, mv_fwd, mv_bwd):
         T, H, W, _ = lr.shape
         ch = cw = self.crop_lr
         if ch is None or H < ch or W < cw:
-            return lr, gt, mv_fwd, mv_bwd, res
+            return lr, gt, mv_fwd, mv_bwd
         y0 = random.randint(0, H - ch)
         x0 = random.randint(0, W - cw)
 
@@ -163,15 +157,13 @@ class RedsMVSRDataset(Dataset):
 
         mv_fwd = mv_fwd[:, :, y0:y0+ch, x0:x0+cw]
         mv_bwd = mv_bwd[:, :, y0:y0+ch, x0:x0+cw]
-        res    = res[:, y0:y0+ch, x0:x0+cw]
 
-        return lr, gt, mv_fwd, mv_bwd, res
+        return lr, gt, mv_fwd, mv_bwd
 
-    def _augment(self, lr, gt, mv_fwd, mv_bwd, res):
+    def _augment(self, lr, gt, mv_fwd, mv_bwd):
         if random.random() < 0.5:
             lr  = lr[:, :, ::-1]
             gt  = gt[:, :, ::-1]
-            res = res[:, :, ::-1]
             mv_fwd = mv_fwd[:, :, :, ::-1]
             mv_bwd = mv_bwd[:, :, :, ::-1]
             mv_fwd[:, 0] *= -1.0
@@ -180,7 +172,6 @@ class RedsMVSRDataset(Dataset):
         if random.random() < 0.5:
             lr  = lr[:, ::-1, :]
             gt  = gt[:, ::-1, :]
-            res = res[:, ::-1, :]
             mv_fwd = mv_fwd[:, :, ::-1, :]
             mv_bwd = mv_bwd[:, :, ::-1, :]
             mv_fwd[:, 1] *= -1.0
@@ -189,31 +180,31 @@ class RedsMVSRDataset(Dataset):
         if random.random() < 0.5:
             lr  = lr.transpose(0, 2, 1, 3)
             gt  = gt.transpose(0, 2, 1, 3)
-            res = res.transpose(0, 2, 1)
             mv_fwd = mv_fwd.transpose(0, 1, 3, 2)
             mv_bwd = mv_bwd.transpose(0, 1, 3, 2)
             mv_fwd = mv_fwd[:, [1, 0]]
             mv_bwd = mv_bwd[:, [1, 0]]
 
-        return lr, gt, mv_fwd, mv_bwd, res
+        return lr, gt, mv_fwd, mv_bwd
 
     def __getitem__(self, idx):
         clip, s = self.samples[idx]
-        lr, gt, mv_fwd, mv_bwd, res, part = self._load_seq(clip, s)
+        lr, gt, mv_fwd, mv_bwd, part, ftypes = self._load_seq(clip, s)
 
         if self.crop_lr is not None:
-            lr, gt, mv_fwd, mv_bwd, res = self._random_crop(lr, gt, mv_fwd, mv_bwd, res)
+            lr, gt, mv_fwd, mv_bwd = self._random_crop(lr, gt, mv_fwd, mv_bwd)
         if self.augment:
-            lr, gt, mv_fwd, mv_bwd, res = self._augment(lr, gt, mv_fwd, mv_bwd, res)
+            lr, gt, mv_fwd, mv_bwd = self._augment(lr, gt, mv_fwd, mv_bwd)
 
         imgs = torch.stack([to_tensor01(im) for im in lr], dim=0)  # (T,3,H,W)
         gts  = torch.stack([to_tensor01(im) for im in gt], dim=0)  # (T,3,4H,4W)
 
         mv_fwd_t = torch.from_numpy(np.ascontiguousarray(mv_fwd)).float()  # (T,2,H,W)
         mv_bwd_t = torch.from_numpy(np.ascontiguousarray(mv_bwd)).float()  # (T,2,H,W)
-        res_t    = torch.from_numpy(np.ascontiguousarray(res)).unsqueeze(1).float()  # (T,1,H,W)
         part_t = torch.from_numpy(np.ascontiguousarray(part)).long() # (T, H/16, W/16)
-        return imgs, gts, mv_fwd_t, mv_bwd_t, res_t, part_t, clip, s
+        ftypes_t = torch.from_numpy(np.ascontiguousarray(ftypes)).long() # (T,)
+
+        return imgs, gts, mv_fwd_t, mv_bwd_t, part_t, ftypes_t, clip, s
 
     def __len__(self):
         return len(self.samples)

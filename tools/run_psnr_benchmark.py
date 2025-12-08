@@ -1,6 +1,5 @@
 import os
 import matplotlib.pyplot as plt
-from mv_warp import main
 import csv
 from dataclasses import dataclass
 from pathlib import Path

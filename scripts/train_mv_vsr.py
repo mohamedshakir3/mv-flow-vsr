@@ -12,15 +12,16 @@ from src.mvvsr.data import RedsMVSRDataset, psnr_torch_perframe, charbonnier_los
 def evaluate(model, loader, device, amp_dtype=torch.float16):
     model.eval()
     psnr_sum, ncount = 0.0, 0
-    for imgs, gts, mv_fwd, mv_bwd, residual, partition_maps, _, _ in tqdm(loader, desc="val", leave=False):
+    for imgs, gts, mv_fwd, mv_bwd, partition_maps, ftypes, _, _ in tqdm(loader, desc="val", leave=False):
         imgs     = imgs.to(device, non_blocking=True)       # (B,T,3,H,W)
         gts      = gts.to(device, non_blocking=True)        # (B,T,3,4H,4W)
         mv_fwd   = mv_fwd.to(device, non_blocking=True)     # (B,T,2,H,W)
         mv_bwd   = mv_bwd.to(device, non_blocking=True)     # (B,T,2,H,W)
         partition_maps = partition_maps.to(device, non_blocking=True)
+        ftypes   = ftypes.to(device, non_blocking=True)     # (B,T)
 
         with torch.autocast(device_type="cuda", dtype=amp_dtype):
-            sr = model(imgs, mv_fwd, mv_bwd, residual, partition_maps)
+            sr = model(imgs, mv_fwd, mv_bwd, partition_maps, ftypes)
 
         psnr_sum += float(psnr_torch_perframe(sr, gts)) * imgs.size(0)
         ncount   += imgs.size(0)
@@ -128,17 +129,17 @@ def main():
     for epoch in range(1, args.epochs + 1):
         model.train()
         pbar = tqdm(train_loader, desc=f"Train epoch {epoch}")
-        for imgs, gts, mv_fwd, mv_bwd, residual, partition_maps, _, _ in pbar:
+        for imgs, gts, mv_fwd, mv_bwd, partition_maps, ftypes, _, _ in pbar:
             imgs           = imgs.to(device, non_blocking=True)
             gts            = gts.to(device, non_blocking=True)
             mv_fwd         = mv_fwd.to(device, non_blocking=True)
             mv_bwd         = mv_bwd.to(device, non_blocking=True)
-            # residual       = residual.to(device, non_blocking=True)
             partition_maps = partition_maps.to(device, non_blocking=True)
+            ftypes   = ftypes.to(device, non_blocking=True)
 
             opt.zero_grad(set_to_none=True)
             with torch.autocast(device_type="cuda", dtype=amp_dtype):
-                sr = model(imgs, mv_fwd, mv_bwd, residual, partition_maps)
+                sr = model(imgs, mv_fwd, mv_bwd, partition_maps, ftypes)
                 loss = charbonnier_loss(sr, gts)
 
             scaler.scale(loss).backward()

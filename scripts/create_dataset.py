@@ -234,8 +234,7 @@ def main():
 
     mv_extractor = Path(args.mv_extractor)
 
-    train_dir = reds_root / "train_sharp"
-
+    train_dir = reds_root / "val_sharp"
     process_reds_train_sharp(
         train_sharp_dir=train_dir,
         out_root=out_root,

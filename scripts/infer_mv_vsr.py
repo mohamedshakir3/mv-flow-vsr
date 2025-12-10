@@ -7,7 +7,6 @@ import cv2
 import torch
 from tqdm import tqdm
 from src.mvvsr.models.mv_vsr import MVSR
-import torch.nn.functional as F
 
 def imread_rgb(path):
     bgr = cv2.imread(path, cv2.IMREAD_COLOR)
@@ -23,7 +22,7 @@ def save_rgb(path, img_rgb):
 def load_mv(path, h, w):
     """Loads (2, H, W) motion vector field."""
     if not os.path.exists(path):
-        return np.zeros((2, h, w), dtype=np.float32)
+        raise ValueError(f"MV file not found: {path}")
     
     data = np.load(path)
     if "flow_fwd" in data:
@@ -37,24 +36,6 @@ def load_mv(path, h, w):
         f = np.transpose(f, (2, 0, 1))
         
     return f.astype(np.float32)
-
-def load_residual(path, h, w):
-    """Loads (1, H, W) residual map."""
-    if not os.path.exists(path):
-        return np.zeros((1, h, w), dtype=np.float32)
-    res = np.load(path).astype(np.float32)
-    if res.ndim == 2:
-        res = res[np.newaxis, ...] # (1, H, W)
-    return res
-
-def load_partition(path, h, w):
-    """Loads (H, W) partition map (integers)."""
-    if not os.path.exists(path):
-        return np.full((h, w), 2, dtype=np.int64)
-    
-    p = np.load(path).astype(np.int64)
-        
-    return p
 
 def run_sequence(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -90,11 +71,20 @@ def run_sequence(args):
     T = len(lr_paths)
 
     print(f"Processing sequence T={T} frames, {W}x{H}")
+    if args.ablate_mvs:
+        print("ABLATION MODE: All MVs disabled")
+    if args.ablate_second_order:
+        print("ABLATION MODE: Second order propagation disabled")
 
     imgs_t = []
     mv_fwd_t = []
     mv_bwd_t = []
-    part_t = []
+
+    ftype_path = os.path.join(clip_root, "meta", "frame_types.npy")
+    all_ftypes = np.load(ftype_path).astype(np.int64)
+    seq_ftypes = all_ftypes[:T] 
+        
+    ftypes = torch.from_numpy(seq_ftypes).long()
 
     for i, path in enumerate(tqdm(lr_paths, desc="Loading Data")):
         img = imread_rgb(path)
@@ -108,49 +98,37 @@ def run_sequence(args):
         mv_fwd_t.append(torch.from_numpy(load_mv(p_fwd, H, W)))
         mv_bwd_t.append(torch.from_numpy(load_mv(p_bwd, H, W)))
 
-        p_part = os.path.join(clip_root, "partition_maps", f"{stem}.npy")
-        if not os.path.exists(p_part):
-             p_part = os.path.join(clip_root, "partition_maps", f"{stem}_part.npy")
-             
-        part_t.append(torch.from_numpy(load_partition(p_part, H, W)))
-
     imgs = torch.stack(imgs_t, dim=0).unsqueeze(0)         # (1, T, 3, H, W)
     mv_fwd = torch.stack(mv_fwd_t, dim=0).unsqueeze(0)     # (1, T, 2, H, W)
     mv_bwd = torch.stack(mv_bwd_t, dim=0).unsqueeze(0)     # (1, T, 2, H, W)
-    part = torch.stack(part_t, dim=0).unsqueeze(0)         # (1, T, H, W)
-    
-    part = torch.full_like(part, 2)
-    mv_fwd = torch.zeros_like(mv_fwd)
-    mv_bwd = torch.zeros_like(mv_bwd)
-    
-    # 0: 22.911
-    # 1: 23.857
-    # 2: 26.248
-    # mix: 25.775
-    # mix no MV: 25.713
+    ftypes = ftypes.unsqueeze(0)                           # (1, T)
 
     imgs = imgs.to(device)
     mv_fwd = mv_fwd.to(device)
     mv_bwd = mv_bwd.to(device)
-    part = part.to(device)
+    ftypes = ftypes.to(device)
 
     amp_dtype = torch.bfloat16 if (device.type=='cuda' and args.amp=='bf16') else None
-    B, T, H, W = part.shape
+
     with torch.no_grad():
         if amp_dtype is not None:
             with torch.autocast(device_type='cuda', dtype=amp_dtype):
-                output = model(imgs, mv_fwd, mv_bwd, part)
+                output = model(imgs, mv_fwd, mv_bwd, ftypes, 
+                               ablate_second_order=args.ablate_second_order,
+                               ablate_mvs=args.ablate_mvs)
         else:
-            output = model(imgs, mv_fwd, mv_bwd, part)
-    # Output shape: (1, T, 3, 4H, 4W)
-    output = output.squeeze(0).cpu() # (T, 3, 4H, 4W)
+            output = model(imgs, mv_fwd, mv_bwd, ftypes,
+                           ablate_second_order=args.ablate_second_order,
+                           ablate_mvs=args.ablate_mvs)
+            
+    output = output.squeeze(0).cpu() 
     
     print(f"Saving {T} frames to {args.out_dir}...")
     os.makedirs(args.out_dir, exist_ok=True)
     
     for i in range(T):
-        tensor = output[i].clamp(0, 1).numpy() # (3, 4H, 4W)
-        tensor = np.transpose(tensor, (1, 2, 0)) # (4H, 4W, 3)
+        tensor = output[i].clamp(0, 1).numpy()
+        tensor = np.transpose(tensor, (1, 2, 0))
         tensor = (tensor * 255.0).astype(np.uint8)
         
         fn = os.path.basename(lr_paths[i])
@@ -178,6 +156,12 @@ if __name__ == '__main__':
     ap.add_argument('--fps', type=int, default=25)
     ap.add_argument('--video', default='out.mp4', help='Name of output video file')
     ap.add_argument('--amp', default='bf16')
+    
+    ap.add_argument('--ablate_mvs', action='store_true', help="Ablation: Disable MVs")
+    ap.add_argument('--ablate_second_order', action='store_true', help="Ablation: Disable 2nd Order MVs")
+    # 24.557 with no MVS and no second order order propogation
+    # 24.605 dB with no 2nd order MVs
+    # 24.662 with 2nd order MVs
     args = ap.parse_args()
     
     run_sequence(args)

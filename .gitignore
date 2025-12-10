@@ -6,7 +6,6 @@ __pycache__/
 inputs/
 psnr
 train
-weights
 VSR
 *.aux
 *.fdb_latexmk
@@ -21,5 +20,6 @@ VSR
 *.csv
 .encodings/
 .DS_Store
+tools/
 # flows_train/
 # flows_val/

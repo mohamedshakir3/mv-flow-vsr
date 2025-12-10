@@ -73,6 +73,51 @@ class PartitionMap(nn.Module):
         out_small = self.conv_small(x) * mask_small
         
         return x + out_large + out_inter + out_small
+    
+class PartitionMap(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+
+        self.conv_large = nn.Sequential(
+            nn.Conv2d(dim, dim, 3, 1, 1), nn.ReLU(inplace=True),
+            nn.Conv2d(dim, dim, 3, 1, 1)
+        )
+        self.conv_inter = nn.Sequential(
+            nn.Conv2d(dim, dim, 3, 1, 1), nn.ReLU(inplace=True),
+            nn.Conv2d(dim, dim, 3, 1, 1)
+        )
+        self.conv_small = nn.Sequential(
+            nn.Conv2d(dim, dim, 3, 1, 1), nn.ReLU(inplace=True),
+            nn.Conv2d(dim, dim, 3, 1, 1)
+        )
+        
+
+    def smooth_mask(self, mask):
+        return F.avg_pool2d(mask, kernel_size=5, stride=1, padding=2)
+
+    def forward(self, x, partition_map):
+        B, C, H, W = x.shape
+        
+        if partition_map.shape[-1] != W:
+            partition_map = F.interpolate(
+                partition_map.unsqueeze(1).float(), 
+                size=(H, W), 
+                mode='nearest'
+            ).squeeze(1).long()
+            
+        mask_large = (partition_map == 0).float().unsqueeze(1)
+        mask_inter = (partition_map == 1).float().unsqueeze(1)
+        mask_small = (partition_map >= 2).float().unsqueeze(1)
+
+        mask_large = self.smooth_mask(mask_large)
+        mask_inter = self.smooth_mask(mask_inter)
+        mask_small = self.smooth_mask(mask_small)
+
+        out = (self.conv_large(x) * mask_large) + \
+              (self.conv_inter(x) * mask_inter) + \
+              (self.conv_small(x) * mask_small)
+        
+        return x + out
 
 class MVWarp(nn.Module):
     def __init__(self):

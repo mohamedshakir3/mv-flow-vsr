@@ -1,6 +1,5 @@
 out/
 outputs/
-inputs.
 encodings/
 val_encodings/
 __pycache__/

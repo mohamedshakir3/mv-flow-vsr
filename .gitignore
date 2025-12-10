@@ -3,6 +3,7 @@ outputs/
 encodings/
 val_encodings/
 __pycache__/
+inputs/
 psnr
 train
 weights
